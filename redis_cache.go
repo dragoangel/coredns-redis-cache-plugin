@@ -429,14 +429,10 @@ func (re *Redis) Get(ctx context.Context, key string) (*dns.Msg, error) {
 	return m, nil
 }
 
-// evictAsync marks the given key as expired in the background using a
-// detached context. Used on read-path self-heal when the entry is detected
-// as broken (decode failure, empty value, or post-fetch question mismatch),
-// so the next request for that key gets a clean miss + repopulation
-// instead of repeatedly tripping the same broken read until natural TTL.
-//
-// EXPIRE with 0 is preferred over DEL: it doesn't block Redis's main
-// thread freeing memory; the active-expiration cycle reclaims it later.
+// evictAsync schedules a non-blocking EXPIRE 0 (detached ctx, not DEL —
+// keeps Redis's main thread free) on a detected-broken entry. Without it,
+// every hit on the orphan re-trips the same bad read and bumps its error
+// counter — one bad key would read as a fleet-wide incident in monitoring.
 func (re *Redis) evictAsync(parent context.Context, key string) {
 	go func() {
 		if err := re.writeClient.Expire(context.WithoutCancel(parent), key, 0).Err(); err != nil {
