@@ -193,10 +193,12 @@ const (
 	maxNTTL     = 30 * time.Minute
 	failSafeTTL = 5 * time.Second
 
-	// Redis timeouts — 3 retries, worst case: connect 3s, read 3s, write 6s.
+	// Plugin defaults for Redis timeouts. Read + pool wait are kept tight
+	// so a single Redis miss can't stretch a DNS reply past ~1s.
 	defaultConnectTimeout = 1 * time.Second
-	defaultReadTimeout    = 1 * time.Second
+	defaultReadTimeout    = 500 * time.Millisecond
 	defaultWriteTimeout   = 2 * time.Second
+	defaultPoolTimeout    = 500 * time.Millisecond
 
 	// Success is the directive for caching positive responses: success <max_ttl> [<min_ttl>]
 	Success = "success"

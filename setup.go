@@ -318,12 +318,21 @@ func parse(c *caddy.Controller) (*Redis, error) {
 					}
 					switch val {
 					case "max":
-						// MaxRetries: -1 disables, 0 = go-redis default (3), >0 = explicit count.
 						n, err := strconv.Atoi(args[0])
 						if err != nil {
-							return nil, err
+							return nil, c.Errf("retries max: %v", err)
 						}
-						re.maxRetries = n
+						if n < 0 {
+							return nil, c.Errf("retries max cannot be negative: %d", n)
+						}
+						// User-facing 0 = literal "no retries". go-redis treats 0
+						// as "use default (3)", so translate to its -1 disabled
+						// sentinel internally.
+						if n == 0 {
+							re.maxRetries = -1
+						} else {
+							re.maxRetries = n
+						}
 					case "min_backoff":
 						d, err := time.ParseDuration(args[0])
 						if err != nil {

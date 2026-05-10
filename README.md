@@ -81,21 +81,22 @@ combinations rather than silently ignoring them:
   come from `cluster`; the rest of the topology is discovered via `CLUSTER SLOTS`.
 * `sentinel` mode (the `sentinel` directive is set) rejects `endpoint` and `read_endpoint` —
   the master and replicas are discovered via Sentinel.
-* Default mode (neither `cluster` nor `sentinel`): writes go to `endpoint`. If no
-  `read_endpoint` is given, the same client handles reads (standalone). If one or more
-  `read_endpoint` entries are listed, reads are routed across those replicas instead.
-  Rejects `read_from` and `sentinel_username` / `sentinel_password`.
+* Default mode (neither `cluster` nor `sentinel`): writes go to `endpoint`. With no
+  `read_endpoint`, the same client serves reads. With one, that client serves reads.
+  With ≥2, each GET picks a replica at random. Rejects `read_from` and
+  `sentinel_username` / `sentinel_password`.
 
 * **ZONES** (positional) — zones to cache for. Defaults to the surrounding server-block zones.
 * `endpoint` — write endpoint address (default `127.0.0.1:6379`). Accepts IPs or hostnames.
   If a port is omitted, 6379 is assumed.
-* `read_endpoint` — one or more read-only replica addresses. When specified, GET operations are
-  routed to these replicas while SET operations go to `endpoint`.
+* `read_endpoint` — one or more read-only replica addresses. GETs route here, SETs go
+  to `endpoint`. With ≥2 replicas, each GET picks one at random.
 * `db NUMBER` — Redis logical database index for the data plane. Default `0`. Not allowed in
   `cluster` mode (Redis Cluster supports only DB 0).
 * `sentinel` — enable Sentinel mode. **Master Group Name is mandatory** and must be followed
-  by one or more sentinel addresses. When configured, the plugin discovers the current master
-  and replicas automatically. Writes route to the master; reads route to replicas.
+  by one or more sentinel addresses. The plugin discovers the current master and replicas
+  via Sentinel (single quorum subscription); writes go to the master, reads pick a replica
+  at random per GET.
 * `cluster` — enable Cluster mode. Takes one or more seed node addresses; the smart client
   discovers the full topology via `CLUSTER SLOTS`. Mutually exclusive with `sentinel` and
   `read_endpoint`. The `endpoint` directive is ignored in cluster mode.
@@ -116,12 +117,9 @@ combinations rather than silently ignoring them:
   Defaults: MAX_TTL `30m`, MIN_TTL `0`.
 * `timeout` — Redis connection and operation timeouts:
     * `connect` — TCP dial timeout (default: `1s`).
-    * `read` — per-command read timeout (default: `1s`).
+    * `read` — per-command read timeout (default: `500ms`).
     * `write` — per-command write timeout (default: `2s`).
-* `pool` — connection-pool tuning. Each setting maps directly to the corresponding go-redis
-  field; any value left unset (i.e. directive omitted) falls through to go-redis's documented
-  default — values noted below in parentheses are those upstream defaults, *not* hardcoded
-  here. All values are non-negative integers.
+* `pool` — connection-pool tuning. Values are non-negative integers.
     * `size N` — maximum sockets per client (default `10 × runtime.GOMAXPROCS()`).
     * `min_idle N` — minimum idle sockets to keep warm (default `0`).
     * `max_idle N` — maximum idle sockets (default `0` = unlimited).
@@ -131,21 +129,15 @@ combinations rather than silently ignoring them:
       (default `30m`). Set to less than your load balancer / NAT idle drop window.
     * `max_lifetime DURATION` — force-recycle any connection older than this regardless
       of activity (default `0` = no limit).
-    * `wait_timeout DURATION` — how long a query waits for a free connection when the
-      pool is saturated before erroring (default: go-redis uses `read_timeout + 1s`).
+    * `wait_timeout DURATION` — how long a query waits for a free pool connection
+      before erroring (default `500ms`).
 * `retries` — retry behavior for transient network errors:
-    * `max N` — number of retries per operation. **Plugin default is `1`** (one retry on
-      transient errors; absorbs an isolated dropped packet without amplifying a sustained
-      outage into multi-second DNS waits). Set `-1` to disable retries entirely; `0` falls
-      back to go-redis's default of `3` (rarely what you want for an L2 DNS cache);
-      positive values are taken literally.
+    * `max N` — number of retries per operation (default `1`), `0` disables retries.
     * `min_backoff DURATION` — initial backoff between retries (default `8ms` — go-redis).
     * `max_backoff DURATION` — cap on backoff between retries (default `512ms` — go-redis).
     Constraint: `min_backoff` must not exceed `max_backoff` when both are set.
-* `tcp_keepalive DURATION` — interval for TCP keepalive probes on Redis connections.
-  Default uses Go's built-in keepalive interval. Set to a value smaller than your firewall
-  / NAT / service-mesh idle-drop window (often `60s`–`5m`) to keep long-lived idle
-  connections from being silently killed.
+* `tcp_keepalive DURATION` — TCP keepalive probe interval (default Go's built-in).
+  Set below your NAT / firewall / mesh idle-drop window to prevent silent kills.
 * `tls` — enable TLS. **No args.** Verifies the server cert against the OS trust store.
   Use `tls_ca` to override the trust store, `tls_cert`/`tls_key` for mTLS. Implicitly
   enabled by any other `tls_*` directive — bare `tls` is only needed when no other TLS
@@ -276,10 +268,9 @@ pip install --user pre-commit
 pre-commit install
 ```
 
-After installing tools via winget, **close and reopen the terminal** so the
-updated `PATH` is picked up. If `pre-commit` is still not found, add
-`%APPDATA%\Python\Python3XX\Scripts` (replace `3XX` with your installed
-version, see `where python`) to your user `PATH`.
+After winget installs, restart the terminal so the updated `PATH` is picked up;
+if `pre-commit` is still not found, add `%APPDATA%\Python\Python3XX\Scripts`
+to user `PATH`.
 
 From this point every `git commit` runs `gofmt`/`goimports`, `go vet`,
 `go mod tidy`, the test suite, and `golangci-lint`. The hooks invoke `go`
@@ -349,7 +340,7 @@ in the directive list.
 
 ### Explicit read replicas
 
-Writes to a known master, reads round-robin across replicas:
+Writes to a known master, reads random-balanced across replicas:
 
 ```corefile
 redis_cache {

@@ -2,6 +2,7 @@ package redis_cache
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -60,6 +61,68 @@ func TestAddGetRoundtrip(t *testing.T) {
 	}
 	if len(out.Answer) != 1 {
 		t.Fatalf("answer lost in roundtrip: %#v", out.Answer)
+	}
+}
+
+func TestGet_MultiReplicaPoolRandomLB(t *testing.T) {
+	// Three replicas, same key, distinct values per replica. With random
+	// load-balancing, enough Get calls will hit every replica at least once.
+	// The probability of missing any one replica over N=200 picks is
+	// (2/3)^200 ≈ 1e-35 — flake risk is effectively zero.
+	const replicas = 3
+	mrs := make([]*miniredis.Miniredis, replicas)
+	addrs := make([]string, replicas)
+	for i := range replicas {
+		mrs[i] = miniredis.RunT(t)
+		addrs[i] = mrs[i].Addr()
+	}
+
+	// Each replica holds the same DNS message but tagged with its own A record.
+	const qname = "lb.example.com."
+	k := cacheKey(qname, dns.ClassINET, dns.TypeA, false)
+	wantIPs := make(map[string]bool)
+	for i, mr := range mrs {
+		m := new(dns.Msg)
+		m.SetQuestion(qname, dns.TypeA)
+		m.Response = true
+		ip := fmt.Sprintf("192.0.2.%d", 10+i)
+		rr, _ := dns.NewRR(qname + " 60 IN A " + ip)
+		m.Answer = []dns.RR{rr}
+		wire, err := ToBytes(m)
+		if err != nil {
+			t.Fatalf("ToBytes: %v", err)
+		}
+		mr.Set(k, string(wire))
+		mr.SetTTL(k, time.Minute)
+		wantIPs[ip] = true
+	}
+
+	re := New()
+	re.Zones = []string{"."}
+	clients := make([]*redis.Client, replicas)
+	for i, addr := range addrs {
+		clients[i] = redis.NewClient(&redis.Options{Addr: addr})
+	}
+	re.writeClient = clients[0] // never invoked here, but New requires non-nil for close()
+	re.readPool = &readReplicaPool{clients: clients}
+	defer func() { _ = re.close() }()
+
+	got := make(map[string]int)
+	for range 200 {
+		m, err := re.Get(context.Background(), k)
+		if err != nil {
+			t.Fatalf("Get: %v", err)
+		}
+		if m == nil || len(m.Answer) == 0 {
+			t.Fatalf("expected non-empty reply")
+		}
+		ip := m.Answer[0].(*dns.A).A.String()
+		got[ip]++
+	}
+	for ip := range wantIPs {
+		if got[ip] == 0 {
+			t.Errorf("replica with IP %s never picked over 200 calls (distribution: %v)", ip, got)
+		}
 	}
 }
 
