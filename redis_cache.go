@@ -408,7 +408,10 @@ func (re *Redis) Get(ctx context.Context, key string) (*dns.Msg, error) {
 		return nil, err
 	}
 	if len(b) == 0 {
-		return nil, nil // empty value — treat as miss
+		// Should not happen ever, but if faced, evict so we don't keep
+		// handling the same empty value as a miss until natural TTL.
+		re.evictAsync(ctx, key)
+		return nil, nil
 	}
 
 	ttl := 0
@@ -416,7 +419,30 @@ func (re *Redis) Get(ctx context.Context, key string) (*dns.Msg, error) {
 		ttl = int(d.Seconds())
 	}
 
-	return FromBytes(b, ttl)
+	m, err := FromBytes(b, ttl)
+	if err != nil {
+		// Corrupt wire bytes in Redis — self-heal so subsequent reads
+		// don't keep tripping the same decode error.
+		re.evictAsync(ctx, key)
+		return nil, err
+	}
+	return m, nil
+}
+
+// evictAsync marks the given key as expired in the background using a
+// detached context. Used on read-path self-heal when the entry is detected
+// as broken (decode failure, empty value, or post-fetch question mismatch),
+// so the next request for that key gets a clean miss + repopulation
+// instead of repeatedly tripping the same broken read until natural TTL.
+//
+// EXPIRE with 0 is preferred over DEL: it doesn't block Redis's main
+// thread freeing memory; the active-expiration cycle reclaims it later.
+func (re *Redis) evictAsync(parent context.Context, key string) {
+	go func() {
+		if err := re.writeClient.Expire(context.WithoutCancel(parent), key, 0).Err(); err != nil {
+			log.Debugf("Failed to evict cache key %s: %s", key, err)
+		}
+	}()
 }
 
 // get looks up a cached response for the given request. After fetching, the
@@ -440,18 +466,9 @@ func (re *Redis) get(ctx context.Context, state request.Request, server string) 
 		log.Warningf("Redis cache returned mismatched question for %s (got %q type=%d class=%d)",
 			state.Name(), m.Question[0].Name, m.Question[0].Qtype, m.Question[0].Qclass)
 		cacheCollisions.WithLabelValues(server).Inc()
-		// Self-heal: mark the poisoned key as expired so the next request
-		// for it gets a clean miss instead of re-tripping the same
-		// mismatch until natural TTL. EXPIRE with 0 doesn't block Redis
-		// freeing memory (the active-expiration cycle reclaims it later),
-		// unlike DEL. Detached ctx; small window where a concurrent
-		// legitimate write could be evicted — worst case is one extra
-		// upstream fetch.
-		go func() {
-			if expErr := re.writeClient.Expire(context.WithoutCancel(ctx), k, 0).Err(); expErr != nil {
-				log.Debugf("Failed to evict mismatched cache key %s: %s", k, expErr)
-			}
-		}()
+		// Self-heal: mark the poisoned key as expired so the next request for it
+		// gets a clean miss instead of re-tripping the same mismatch until natural TTL.
+		re.evictAsync(ctx, k)
 		return nil
 	}
 	log.Debugf("Returning response from Redis cache: %s for %s", m.Question[0].Name, state.Name())
