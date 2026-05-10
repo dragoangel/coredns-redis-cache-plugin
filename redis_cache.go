@@ -440,6 +440,18 @@ func (re *Redis) get(ctx context.Context, state request.Request, server string) 
 		log.Warningf("Redis cache returned mismatched question for %s (got %q type=%d class=%d)",
 			state.Name(), m.Question[0].Name, m.Question[0].Qtype, m.Question[0].Qclass)
 		cacheCollisions.WithLabelValues(server).Inc()
+		// Self-heal: mark the poisoned key as expired so the next request
+		// for it gets a clean miss instead of re-tripping the same
+		// mismatch until natural TTL. EXPIRE with 0 doesn't block Redis
+		// freeing memory (the active-expiration cycle reclaims it later),
+		// unlike DEL. Detached ctx; small window where a concurrent
+		// legitimate write could be evicted — worst case is one extra
+		// upstream fetch.
+		go func() {
+			if expErr := re.writeClient.Expire(context.WithoutCancel(ctx), k, 0).Err(); expErr != nil {
+				log.Debugf("Failed to evict mismatched cache key %s: %s", k, expErr)
+			}
+		}()
 		return nil
 	}
 	log.Debugf("Returning response from Redis cache: %s for %s", m.Question[0].Name, state.Name())

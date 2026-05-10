@@ -18,6 +18,14 @@ import (
 // key returns the cache key for a DNS message. Returns "" if the message should not be cached.
 // We do not cache truncated responses, errors, meta, or update messages.
 func key(m *dns.Msg, t response.Type, do bool) string {
+	// Defense in depth: standard DNS carries exactly one question (QDCOUNT
+	// can technically be 0 or 2+ per the wire format, but the protocol
+	// never defined semantics for those). Refuse to cache anything else,
+	// matching state.Match's len==1 invariant on the read path so we don't
+	// produce entries that could never legitimately be served.
+	if len(m.Question) != 1 {
+		return ""
+	}
 	if m.Truncated {
 		return ""
 	}
@@ -85,6 +93,19 @@ type ResponseWriter struct {
 }
 
 // WriteMsg implements the dns.ResponseWriter interface.
+//
+// The Redis SET runs in a fire-and-forget goroutine with a context detached
+// from the request, so:
+//
+//   - the DNS reply to the client is never blocked on Redis latency, even when
+//     Redis stalls up to writeTimeout × (maxRetries+1);
+//   - a cache entry still lands when the upstream client cancels mid-flight,
+//     so the next requester gets a hit instead of re-burdening upstream.
+//
+// Wire bytes are packed synchronously: encoding failures are observed at the
+// right time, and the goroutine never reads a *dns.Msg the caller may still
+// mutate after WriteMsg returns. go-redis's own writeTimeout / MaxRetries
+// bound how long the goroutine can run; no extra cap is layered on top.
 func (w *ResponseWriter) WriteMsg(res *dns.Msg) error {
 	do := false
 	mt, opt := response.Typify(res, w.now().UTC())
@@ -111,11 +132,26 @@ func (w *ResponseWriter) WriteMsg(res *dns.Msg) error {
 		duration = minDur
 	}
 
+	// Snapshot wire bytes before TTL clamping mutates `res` for the client,
+	// and before WriteMsg hands the message off. Cache reads recompute TTL
+	// from Redis PTTL, so the stored TTL value is throwaway anyway.
+	var wire []byte
 	if k != "" && duration > 0 {
-		if w.state.Match(res) {
-			w.set(res, k, mt, duration)
-		} else {
+		switch {
+		case !w.state.Match(res):
 			cacheResponseMismatches.WithLabelValues(w.server).Inc()
+		case mt == response.NoError || mt == response.Delegation || mt == response.NameError || mt == response.NoData:
+			b, err := ToBytes(res)
+			if err != nil {
+				log.Debugf("Failed to serialize DNS message for cache: %s", err)
+				cacheEncodeErrors.WithLabelValues(w.server).Inc()
+			} else {
+				wire = b
+			}
+		case mt == response.OtherError:
+			// don't cache
+		default:
+			log.Warningf("Redis called with unknown typification: %d", mt)
 		}
 	}
 
@@ -132,35 +168,18 @@ func (w *ResponseWriter) WriteMsg(res *dns.Msg) error {
 			res.Extra[i].Header().Ttl = ttl
 		}
 	}
-	return w.ResponseWriter.WriteMsg(res)
-}
+	err := w.ResponseWriter.WriteMsg(res)
 
-func (w *ResponseWriter) set(m *dns.Msg, key string, mt response.Type, duration time.Duration) {
-	if key == "" || duration == 0 {
-		return
+	if wire != nil {
+		go func() {
+			if addErr := w.Add(context.WithoutCancel(w.ctx), k, wire, duration); addErr != nil {
+				log.Debugf("Failed to add response to Redis cache: %s", addErr)
+				redisErr.WithLabelValues(w.server).Inc()
+			}
+		}()
 	}
 
-	switch mt {
-	case response.NoError, response.Delegation, response.NameError, response.NoData:
-		// Serialize before touching Redis so a malformed message can't poison
-		// the key with an empty value, and so encoding failures are accounted
-		// to encode_errors_total rather than set_errors_total (which is for
-		// Redis-side write failures).
-		wire, err := ToBytes(m)
-		if err != nil {
-			log.Debugf("Failed to serialize DNS message for cache: %s", err)
-			cacheEncodeErrors.WithLabelValues(w.server).Inc()
-			return
-		}
-		if err := w.Add(w.ctx, key, wire, duration); err != nil {
-			log.Debugf("Failed to add response to Redis cache: %s", err)
-			redisErr.WithLabelValues(w.server).Inc()
-		}
-	case response.OtherError:
-		// don't cache these
-	default:
-		log.Warningf("Redis called with unknown typification: %d", mt)
-	}
+	return err
 }
 
 // Write implements the dns.ResponseWriter interface.

@@ -98,3 +98,28 @@ func TestKey_SkipsErrorMetaUpdate(t *testing.T) {
 		}
 	}
 }
+
+func TestKey_SkipsZeroQuestions(t *testing.T) {
+	// QDCOUNT==0 is technically allowed by the wire format but undefined by
+	// the protocol; refuse to cache rather than panic on m.Question[0].
+	m := new(dns.Msg)
+	m.Response = true
+	if got := key(m, response.NoError, false); got != "" {
+		t.Fatalf("0-question reply must not be cached, got key %q", got)
+	}
+}
+
+func TestKey_SkipsMultipleQuestions(t *testing.T) {
+	// Multi-question DNS was never standardized; refusing to cache keeps
+	// the write path symmetric with state.Match's len==1 invariant on the
+	// read path, and avoids producing entries that could never be served.
+	m := msg("first.example.com.", dns.TypeA)
+	m.Question = append(m.Question, dns.Question{
+		Name:   "second.example.com.",
+		Qtype:  dns.TypeAAAA,
+		Qclass: dns.ClassINET,
+	})
+	if got := key(m, response.NoError, false); got != "" {
+		t.Fatalf("multi-question reply must not be cached, got key %q", got)
+	}
+}

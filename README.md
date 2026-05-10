@@ -159,11 +159,11 @@ combinations rather than silently ignoring them:
   Default `on`. Set to `off` to disable all server-cert verification (chain *and* hostname);
   use only for development or fully-trusted networks. Accepts `on`/`off`, `true`/`false`,
   `yes`/`no`, `1`/`0`.
-* `tls_verify_hostname BOOL` — verify the server cert's SAN/CN matches the hostname dialed.
-  Default `on`. Set to `off` when one configuration connects to multiple peers (cluster
-  seeds, sentinel quorum, replication followers) whose certs share a CA but each carry
-  their own hostname — chain verification still runs, only the per-host SAN/CN check is
-  skipped. Has no effect when `tls_verify_chain` is `off` (chain-off implies hostname-off).
+* `tls_verify_hostname BOOL` — verify the server cert's SAN/CN matches the dialed
+  hostname. Default `on`. Workaround for topologies where the dialed name cannot match
+  the cert SAN (per-pod certs, Cluster MOVED redirects, Sentinel master/replica
+  discovery, VIP fronting); chain verification still runs. Properly-issued certs should
+  not require this. Has no effect when `tls_verify_chain` is `off`. See the example below.
 * `resolver ADDRESS` — DNS server to use for resolving Redis endpoint hostnames instead of the
   system resolver. Useful in deployments where CoreDNS itself intercepts the system resolver
   (e.g. node-local-dns) and resolving the Redis service name through it would create a circular
@@ -431,19 +431,28 @@ redis_cache {
 }
 ```
 
-### TLS — multi-host with shared CA
+### TLS — Kubernetes Redis Cluster with per-pod certs
 
-Cluster / sentinel / multi-replica setups where peers share a CA but each carries its own
-hostname and cert SAN not align — keep chain verification, but skip per-host SAN/CN check:
+Workaround for setups where issuing certs whose SAN matches the dialed name is not
+practical: a StatefulSet-deployed Redis/Valkey cluster typically presents per-pod
+certs (SAN = `<pod>.<headless-svc>.<ns>.svc.cluster.local`), the client dials a
+service name, and Cluster MOVED redirects further route to peers whose SANs won't
+match anything pre-declared. Chain verification still applies to every peer:
 
 ```corefile
 redis_cache {
-    cluster valkey-0:6379 valkey-1:6379 valkey-2:6379
-    tls_ca /etc/redis/tls/ca.pem
+    cluster redis-cluster-0.redis-cluster-headless.cache.svc.cluster.local:6379 \
+            redis-cluster-1.redis-cluster-headless.cache.svc.cluster.local:6379 \
+            redis-cluster-2.redis-cluster-headless.cache.svc.cluster.local:6379
+    tls_ca              /etc/redis/tls/ca.pem
     tls_verify_hostname off
-    password s3cret
+    password            s3cret
 }
 ```
+
+Same workaround applies to Sentinel-discovered masters/replicas and HA-proxy/VIP
+fronting a fleet of per-pod certs. Prefer issuing certs whose SAN covers the dialed
+name where you control the PKI.
 
 ### Kubernetes node-local-dns
 

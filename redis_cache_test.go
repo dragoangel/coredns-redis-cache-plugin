@@ -174,6 +174,67 @@ func TestServeDNS_CacheMiss_FallsThrough(t *testing.T) {
 	}
 }
 
+func TestServeDNS_UpstreamMiss_PopulatesCacheAsync(t *testing.T) {
+	// On a cache miss the upstream reply is written back asynchronously, so
+	// the next request for the same name hits Redis instead of forwarding
+	// upstream again. Polls Redis (the SET runs in a fire-and-forget
+	// goroutine, so the key may not be present the instant ServeDNS returns).
+	re, mr, cleanup := newTestRedis(t)
+	defer cleanup()
+
+	answer, _ := dns.NewRR("example.com. 60 IN A 192.0.2.1")
+	re.Next = &fakeNext{rcode: dns.RcodeSuccess, answer: []dns.RR{answer}}
+
+	q := new(dns.Msg)
+	q.SetQuestion("example.com.", dns.TypeA)
+	rec := dnstest.NewRecorder(&test.ResponseWriter{})
+	if _, err := re.ServeDNS(context.Background(), rec, q); err != nil {
+		t.Fatalf("ServeDNS: %v", err)
+	}
+
+	k := cacheKey("example.com.", dns.ClassINET, dns.TypeA, false)
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if mr.Exists(k) {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("expected key %q to be populated by the async cache write", k)
+}
+
+func TestServeDNS_AsyncWriteSurvivesClientCancel(t *testing.T) {
+	// Even if the client cancels the request after the upstream reply, the
+	// cache write must still land — that's the whole point of doing it on a
+	// detached context (future requesters get a hit instead of re-burdening
+	// upstream).
+	re, mr, cleanup := newTestRedis(t)
+	defer cleanup()
+
+	answer, _ := dns.NewRR("late.example.com. 60 IN A 192.0.2.2")
+	re.Next = &fakeNext{rcode: dns.RcodeSuccess, answer: []dns.RR{answer}}
+
+	q := new(dns.Msg)
+	q.SetQuestion("late.example.com.", dns.TypeA)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	rec := dnstest.NewRecorder(&test.ResponseWriter{})
+	if _, err := re.ServeDNS(ctx, rec, q); err != nil {
+		t.Fatalf("ServeDNS: %v", err)
+	}
+	cancel() // simulate client going away after the response was written
+
+	k := cacheKey("late.example.com.", dns.ClassINET, dns.TypeA, false)
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if mr.Exists(k) {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("cache write was lost when the client cancelled (expected detached ctx to keep it alive)")
+}
+
 func TestServeDNS_QuestionMismatch_TreatedAsMiss(t *testing.T) {
 	// If a stored entry's question does not match the request, the plugin
 	// must not serve it — it should fall through to Next and bump
@@ -219,6 +280,49 @@ func TestServeDNS_QuestionMismatch_TreatedAsMiss(t *testing.T) {
 			t.Fatalf("attacker IP leaked through: %s", ans)
 		}
 	}
+}
+
+func TestServeDNS_QuestionMismatch_SelfHeals(t *testing.T) {
+	// After detecting a mismatched cached entry, the plugin must evict it
+	// from Redis so subsequent requests for that key see a clean miss
+	// instead of repeatedly tripping the same collision.
+	re, mr, cleanup := newTestRedis(t)
+	defer cleanup()
+
+	wrong := new(dns.Msg)
+	wrong.SetQuestion("attacker.example.com.", dns.TypeA)
+	wrong.Response = true
+	rr, _ := dns.NewRR("attacker.example.com. 60 IN A 198.51.100.1")
+	wrong.Answer = []dns.RR{rr}
+
+	victimKey := cacheKey("victim.example.com.", dns.ClassINET, dns.TypeA, false)
+	wire, err := ToBytes(wrong)
+	if err != nil {
+		t.Fatalf("ToBytes: %v", err)
+	}
+	if err := re.Add(context.Background(), victimKey, wire, time.Minute); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+
+	re.Next = &fakeNext{rcode: dns.RcodeSuccess}
+
+	q := new(dns.Msg)
+	q.SetQuestion("victim.example.com.", dns.TypeA)
+	rec := dnstest.NewRecorder(&test.ResponseWriter{})
+	if _, err := re.ServeDNS(context.Background(), rec, q); err != nil {
+		t.Fatalf("ServeDNS: %v", err)
+	}
+
+	// Eviction is async (fire-and-forget goroutine); poll for the absence
+	// of the bad key.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if !mr.Exists(victimKey) {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("expected key %q to be evicted by self-heal, but it persisted", victimKey)
 }
 
 func TestServeDNS_DecodeErrorTreatedAsMiss(t *testing.T) {
