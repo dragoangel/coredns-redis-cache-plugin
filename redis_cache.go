@@ -25,8 +25,8 @@ type Redis struct {
 	// Used for standalone, sentinel, cluster, and the explicit-replicas mode
 	// when there is exactly one read endpoint. nil when readPool is in use.
 	readClient redis.UniversalClient
-	// readPool round-robins (random pick) GETs across N>=2 explicit read
-	// replicas. nil for all other modes.
+	// readPool serves GETs from N>=2 explicit read replicas, picking one at
+	// random per call. nil for all other modes.
 	readPool *readReplicaPool
 
 	// writeFlight dedupes concurrent Redis SETs for the same cache key.
@@ -268,8 +268,8 @@ func (re *Redis) close() error {
 
 // Add stores already-serialized wire bytes under the given key in Redis with
 // the specified duration. Writes always go to the master/write client.
-// Serialization is the caller's responsibility (see set()) so that pack errors
-// and Redis-side errors can be reported on different metrics.
+// Serialization is the caller's responsibility (done in WriteMsg before this
+// is invoked) so pack errors and Redis-side errors stay on distinct metrics.
 func (re *Redis) Add(ctx context.Context, key string, wire []byte, duration time.Duration) error {
 	return re.writeClient.Set(ctx, key, wire, duration).Err()
 }
