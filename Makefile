@@ -93,14 +93,14 @@ release: ## Tag a release. Usage: make release VERSION=vX.Y.Z
 		v[0-9]*.[0-9]*.[0-9]*) ;; \
 		*) echo "VERSION must be vMAJOR.MINOR.PATCH (e.g. v0.1.0)" >&2; exit 1 ;; \
 	esac
-	@if [ -n "$$(git status --porcelain)" ]; then \
-		echo "Working tree is dirty. Commit or stash first." >&2; exit 1; \
+	@if [ -z "$(ALLOW_DIRTY)" ] && [ -n "$$(git status --porcelain)" ]; then \
+		echo "Working tree is dirty. Commit or stash first, or set ALLOW_DIRTY=1 to override." >&2; exit 1; \
 	fi
 	@if git rev-parse "$(VERSION)" >/dev/null 2>&1; then \
 		echo "Tag $(VERSION) already exists." >&2; exit 1; \
 	fi
 	$(MAKE) ci
-	git tag -a "$(VERSION)" -m "Release $(VERSION)"
+	@GPG_TTY=$$(tty) git tag -a "$(VERSION)" -m "Release $(VERSION)"
 	@echo
 	@echo "Tagged $(VERSION) locally. To publish:"
 	@echo "    git push origin $(VERSION)"
