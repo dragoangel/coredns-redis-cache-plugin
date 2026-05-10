@@ -1,0 +1,246 @@
+package redis_cache
+
+import (
+	"context"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/alicebob/miniredis/v2"
+	"github.com/coredns/coredns/plugin/pkg/dnstest"
+	"github.com/coredns/coredns/plugin/test"
+	"github.com/miekg/dns"
+	"github.com/redis/go-redis/v9"
+)
+
+// newTestRedis starts a miniredis and returns a Redis plugin wired to it.
+// The returned cleanup closes both.
+func newTestRedis(t *testing.T) (*Redis, *miniredis.Miniredis, func()) {
+	t.Helper()
+	mr := miniredis.RunT(t)
+
+	re := New()
+	re.Zones = []string{"."}
+	client := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	re.writeClient = client
+	re.readClient = client
+	cleanup := func() { _ = client.Close() }
+	return re, mr, cleanup
+}
+
+func TestAddGetRoundtrip(t *testing.T) {
+	re, _, cleanup := newTestRedis(t)
+	defer cleanup()
+
+	in := new(dns.Msg)
+	in.SetQuestion("example.com.", dns.TypeA)
+	in.Response = true
+	rr, _ := dns.NewRR("example.com. 60 IN A 192.0.2.1")
+	in.Answer = []dns.RR{rr}
+
+	k := cacheKey("example.com.", dns.ClassINET, dns.TypeA, false)
+	wire, err := ToBytes(in)
+	if err != nil {
+		t.Fatalf("ToBytes: %v", err)
+	}
+	if err := re.Add(context.Background(), k, wire, time.Minute); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+
+	out, err := re.Get(context.Background(), k)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if out == nil {
+		t.Fatal("Get returned nil for a known key")
+	}
+	if out.Question[0].Name != "example.com." || out.Question[0].Qtype != dns.TypeA {
+		t.Fatalf("roundtripped question mismatched: %#v", out.Question)
+	}
+	if len(out.Answer) != 1 {
+		t.Fatalf("answer lost in roundtrip: %#v", out.Answer)
+	}
+}
+
+func TestGet_Miss(t *testing.T) {
+	re, _, cleanup := newTestRedis(t)
+	defer cleanup()
+
+	out, err := re.Get(context.Background(), "no-such-key")
+	if err != nil {
+		t.Fatalf("Get on missing key returned err=%v", err)
+	}
+	if out != nil {
+		t.Fatalf("Get on missing key returned non-nil msg: %#v", out)
+	}
+}
+
+func TestGet_GarbagePropagatesError(t *testing.T) {
+	// A corrupt Redis value must surface as an error so the caller treats
+	// it as a read error rather than an empty NODATA reply.
+	re, mr, cleanup := newTestRedis(t)
+	defer cleanup()
+
+	const k = "corrupt"
+	// A few bytes is shorter than the 12-byte DNS header — guaranteed unpack failure.
+	mr.Set(k, "\x00\x01\x02")
+
+	out, err := re.Get(context.Background(), k)
+	if err == nil {
+		t.Fatalf("expected decode error, got msg=%#v", out)
+	}
+	if out != nil {
+		t.Fatalf("expected nil msg on decode error, got %#v", out)
+	}
+}
+
+// fakeNext is a plugin.Handler that records that it was called and returns a
+// canned response.
+type fakeNext struct {
+	called bool
+	rcode  int
+	answer []dns.RR
+}
+
+func (f *fakeNext) ServeDNS(_ context.Context, w dns.ResponseWriter, r *dns.Msg) (int, error) {
+	f.called = true
+	resp := new(dns.Msg)
+	resp.SetReply(r)
+	resp.Rcode = f.rcode
+	resp.Answer = f.answer
+	_ = w.WriteMsg(resp)
+	return f.rcode, nil
+}
+func (f *fakeNext) Name() string { return "fakeNext" }
+
+func TestServeDNS_CacheHit(t *testing.T) {
+	re, _, cleanup := newTestRedis(t)
+	defer cleanup()
+
+	// Pre-populate the cache for example.com. A.
+	cached := new(dns.Msg)
+	cached.SetQuestion("example.com.", dns.TypeA)
+	cached.Response = true
+	rr, _ := dns.NewRR("example.com. 60 IN A 192.0.2.1")
+	cached.Answer = []dns.RR{rr}
+
+	k := cacheKey("example.com.", dns.ClassINET, dns.TypeA, false)
+	wire, err := ToBytes(cached)
+	if err != nil {
+		t.Fatalf("ToBytes: %v", err)
+	}
+	if err := re.Add(context.Background(), k, wire, time.Minute); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+
+	next := &fakeNext{}
+	re.Next = next
+
+	q := new(dns.Msg)
+	q.SetQuestion("example.com.", dns.TypeA)
+
+	rec := dnstest.NewRecorder(&test.ResponseWriter{})
+	rcode, err := re.ServeDNS(context.Background(), rec, q)
+	if err != nil {
+		t.Fatalf("ServeDNS: %v", err)
+	}
+	if rcode != dns.RcodeSuccess {
+		t.Fatalf("rcode: got %d, want %d", rcode, dns.RcodeSuccess)
+	}
+	if next.called {
+		t.Fatal("Next was invoked on a cache hit; it should be served from Redis")
+	}
+	if rec.Msg == nil || len(rec.Msg.Answer) != 1 {
+		t.Fatalf("expected 1 answer, got msg=%#v", rec.Msg)
+	}
+}
+
+func TestServeDNS_CacheMiss_FallsThrough(t *testing.T) {
+	re, _, cleanup := newTestRedis(t)
+	defer cleanup()
+
+	next := &fakeNext{rcode: dns.RcodeSuccess}
+	re.Next = next
+
+	q := new(dns.Msg)
+	q.SetQuestion("missing.example.com.", dns.TypeA)
+
+	rec := dnstest.NewRecorder(&test.ResponseWriter{})
+	if _, err := re.ServeDNS(context.Background(), rec, q); err != nil {
+		t.Fatalf("ServeDNS: %v", err)
+	}
+	if !next.called {
+		t.Fatal("Next was not invoked on a cache miss")
+	}
+}
+
+func TestServeDNS_QuestionMismatch_TreatedAsMiss(t *testing.T) {
+	// If a stored entry's question does not match the request, the plugin
+	// must not serve it — it should fall through to Next and bump
+	// cacheCollisions. Simulated by SETing a message for one name under
+	// the cache key of another name.
+	re, _, cleanup := newTestRedis(t)
+	defer cleanup()
+
+	wrong := new(dns.Msg)
+	wrong.SetQuestion("attacker.example.com.", dns.TypeA)
+	wrong.Response = true
+	rr, _ := dns.NewRR("attacker.example.com. 60 IN A 198.51.100.1")
+	wrong.Answer = []dns.RR{rr}
+
+	// Store under the key of victim.example.com. — what a hash collision or
+	// version-skew bug would look like.
+	victimKey := cacheKey("victim.example.com.", dns.ClassINET, dns.TypeA, false)
+	wire, err := ToBytes(wrong)
+	if err != nil {
+		t.Fatalf("ToBytes: %v", err)
+	}
+	if err := re.Add(context.Background(), victimKey, wire, time.Minute); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+
+	next := &fakeNext{rcode: dns.RcodeSuccess}
+	re.Next = next
+
+	q := new(dns.Msg)
+	q.SetQuestion("victim.example.com.", dns.TypeA)
+
+	rec := dnstest.NewRecorder(&test.ResponseWriter{})
+	if _, err := re.ServeDNS(context.Background(), rec, q); err != nil {
+		t.Fatalf("ServeDNS: %v", err)
+	}
+	if !next.called {
+		t.Fatal("Next was not invoked: plugin served a mismatched cached entry")
+	}
+	// rec.Msg should reflect Next's reply, not the attacker's record.
+	if rec.Msg != nil && len(rec.Msg.Answer) > 0 {
+		ans := rec.Msg.Answer[0].String()
+		if strings.Contains(ans, "198.51.100.1") {
+			t.Fatalf("attacker IP leaked through: %s", ans)
+		}
+	}
+}
+
+func TestServeDNS_DecodeErrorTreatedAsMiss(t *testing.T) {
+	// A corrupt Redis value must not be served as an empty reply — the
+	// read error propagates and the chain falls through to Next.
+	re, mr, cleanup := newTestRedis(t)
+	defer cleanup()
+
+	k := cacheKey("example.com.", dns.ClassINET, dns.TypeA, false)
+	mr.Set(k, "\x00\x01\x02") // shorter than DNS header — unpack fails
+
+	next := &fakeNext{rcode: dns.RcodeSuccess}
+	re.Next = next
+
+	q := new(dns.Msg)
+	q.SetQuestion("example.com.", dns.TypeA)
+
+	rec := dnstest.NewRecorder(&test.ResponseWriter{})
+	if _, err := re.ServeDNS(context.Background(), rec, q); err != nil {
+		t.Fatalf("ServeDNS: %v", err)
+	}
+	if !next.called {
+		t.Fatal("Next was not invoked: corrupt cache entry was served as a hit")
+	}
+}

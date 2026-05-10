@@ -1,28 +1,25 @@
 package redis_cache
 
 import (
-	"encoding/base64"
-
 	"github.com/miekg/dns"
 )
 
-// ToString converts the DNS message m to a base64 encoded string.
-func ToString(m *dns.Msg) string {
-	b, _ := m.Pack()
-	return base64.RawStdEncoding.EncodeToString(b)
+// ToBytes packs the DNS message into wire format. The packed bytes are stored
+// in Redis verbatim — RESP and go-redis are binary-safe so there's no need to
+// base64-encode (which would inflate every cached entry by ~33%).
+func ToBytes(m *dns.Msg) ([]byte, error) {
+	return m.Pack()
 }
 
-// FromString converts a base64 encoded string back into a DNS message
-// and applies the given TTL to all records.
-func FromString(s string, ttl int) *dns.Msg {
+// FromBytes unpacks a wire-format DNS message and applies the given TTL to all
+// records. A wire-format error is returned to the caller so a corrupted Redis
+// value is treated as a read error rather than served as an empty (NODATA-
+// spoofing) reply.
+func FromBytes(b []byte, ttl int) (*dns.Msg, error) {
 	m := new(dns.Msg)
-	b, err := base64.RawStdEncoding.DecodeString(s)
-	if err != nil {
-		return m
-	}
 	if err := m.Unpack(b); err != nil {
-		return m
+		return nil, err
 	}
 	setMsgTTL(m, ttl)
-	return m
+	return m, nil
 }

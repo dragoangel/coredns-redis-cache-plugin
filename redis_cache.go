@@ -23,8 +23,8 @@ type Redis struct {
 	// readClient routes to a replica (or the same client) for GET operations.
 	readClient redis.UniversalClient
 
-	pMaxTTL    time.Duration // max TTL for positive (success) responses
-	nMaxTTL    time.Duration // max TTL for negative (denial) responses
+	pMaxTTL time.Duration // max TTL for positive (success) responses
+	nMaxTTL time.Duration // max TTL for negative (denial) responses
 	pMinTTL time.Duration // min TTL for positive responses (floor)
 	nMinTTL time.Duration // min TTL for negative responses (floor)
 
@@ -118,6 +118,7 @@ func New() *Redis {
 //  1. Sentinel: automatic master/replica discovery via Redis Sentinel.
 //  2. Explicit replicas: endpoint for writes + read_endpoint(s) for reads.
 //  3. Standalone: single endpoint for both reads and writes.
+//
 // dialer returns a custom net.Dialer's DialContext when either a custom
 // resolver or a TCP keepalive interval is configured. Otherwise it returns
 // nil, letting go-redis fall back to its built-in dialer.
@@ -139,7 +140,7 @@ func (re *Redis) dialer() func(ctx context.Context, network, addr string) (net.C
 	if re.resolver != "" {
 		d.Resolver = &net.Resolver{
 			PreferGo: true,
-			Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
+			Dial: func(ctx context.Context, _, _ string) (net.Conn, error) {
 				inner := net.Dialer{Timeout: re.connectTimeout}
 				return inner.DialContext(ctx, "udp", re.resolver)
 			},
@@ -157,7 +158,8 @@ func (re *Redis) connect() error {
 		return fmt.Errorf("tls: %w", err)
 	}
 
-	if len(re.clusterAddrs) > 0 {
+	switch {
+	case len(re.clusterAddrs) > 0:
 		// Cluster mode — single client routes by hash slot across shards.
 		// Note: Redis Cluster only supports DB 0; re.db is intentionally not
 		// passed here, and the parser rejects `db != 0` together with `cluster`.
@@ -194,7 +196,7 @@ func (re *Redis) connect() error {
 		client := redis.NewClusterClient(opts)
 		re.writeClient = client
 		re.readClient = client
-	} else if re.masterName != "" {
+	case re.masterName != "":
 		// Sentinel mode
 		re.writeClient = redis.NewFailoverClient(&redis.FailoverOptions{
 			MasterName:       re.masterName,
@@ -245,7 +247,7 @@ func (re *Redis) connect() error {
 			Dialer:           dial,
 			TLSConfig:        tlsCfg,
 		})
-	} else if len(re.readEndpoints) > 0 {
+	case len(re.readEndpoints) > 0:
 		// Explicit read replica mode
 		re.writeClient = redis.NewClient(&redis.Options{
 			Addr:            re.addr,
@@ -318,7 +320,7 @@ func (re *Redis) connect() error {
 				TLSConfig:       tlsCfg,
 			})
 		}
-	} else {
+	default:
 		// Standalone mode — single client for both reads and writes
 		client := redis.NewClient(&redis.Options{
 			Addr:            re.addr,
@@ -377,10 +379,12 @@ func (re *Redis) close() error {
 	return nil
 }
 
-// Add stores the DNS message m under the given key in Redis with the specified duration.
-// Writes always go to the master/write client.
-func (re *Redis) Add(ctx context.Context, key string, m *dns.Msg, duration time.Duration) error {
-	return re.writeClient.Set(ctx, key, ToString(m), duration).Err()
+// Add stores already-serialized wire bytes under the given key in Redis with
+// the specified duration. Writes always go to the master/write client.
+// Serialization is the caller's responsibility (see set()) so that pack errors
+// and Redis-side errors can be reported on different metrics.
+func (re *Redis) Add(ctx context.Context, key string, wire []byte, duration time.Duration) error {
+	return re.writeClient.Set(ctx, key, wire, duration).Err()
 }
 
 // Get retrieves a cached DNS message by key from a read replica. Returns:
@@ -396,14 +400,14 @@ func (re *Redis) Get(ctx context.Context, key string) (*dns.Msg, error) {
 		return nil, err
 	}
 
-	s, err := getCmd.Result()
+	b, err := getCmd.Bytes()
 	if err == redis.Nil {
 		return nil, nil // miss
 	}
 	if err != nil {
 		return nil, err
 	}
-	if s == "" {
+	if len(b) == 0 {
 		return nil, nil // empty value — treat as miss
 	}
 
@@ -412,12 +416,15 @@ func (re *Redis) Get(ctx context.Context, key string) (*dns.Msg, error) {
 		ttl = int(d.Seconds())
 	}
 
-	return FromString(s, ttl), nil
+	return FromBytes(b, ttl)
 }
 
-// get looks up a cached response for the given request.
+// get looks up a cached response for the given request. After fetching, the
+// cached message's question is verified to match the request as defense in
+// depth against corrupted entries or version-skewed encodings; a mismatch is
+// reported via cacheCollisions and treated as a miss.
 func (re *Redis) get(ctx context.Context, state request.Request, server string) *dns.Msg {
-	k := cacheKey(state.Name(), state.QType(), state.Do())
+	k := cacheKey(state.Name(), state.QClass(), state.QType(), state.Do())
 
 	m, err := re.Get(ctx, k)
 	if err != nil {
@@ -427,6 +434,12 @@ func (re *Redis) get(ctx context.Context, state request.Request, server string) 
 	}
 	if m == nil {
 		cacheMisses.WithLabelValues(server).Inc()
+		return nil
+	}
+	if !state.Match(m) || m.Question[0].Qclass != state.QClass() {
+		log.Warningf("Redis cache returned mismatched question for %s (got %q type=%d class=%d)",
+			state.Name(), m.Question[0].Name, m.Question[0].Qtype, m.Question[0].Qclass)
+		cacheCollisions.WithLabelValues(server).Inc()
 		return nil
 	}
 	log.Debugf("Returning response from Redis cache: %s for %s", m.Question[0].Name, state.Name())

@@ -29,11 +29,11 @@ var (
 		Help:      "The count of errors when reading entries from Redis.",
 	}, []string{"server"})
 
-	cacheDrops = promauto.NewCounterVec(prometheus.CounterOpts{
+	cacheResponseMismatches = promauto.NewCounterVec(prometheus.CounterOpts{
 		Namespace: plugin.Namespace,
 		Subsystem: "redis_cache",
-		Name:      "drops_total",
-		Help:      "The count of responses not cached because the reply's question doesn't match the request.",
+		Name:      "response_mismatches_total",
+		Help:      "The count of upstream replies whose question did not match the original request and were therefore refused for caching. Non-zero suggests a misbehaving forwarder upstream or an attempted cache-poisoning probe.",
 	}, []string{"server"})
 
 	redisErr = promauto.NewCounterVec(prometheus.CounterOpts{
@@ -41,5 +41,19 @@ var (
 		Subsystem: "redis_cache",
 		Name:      "set_errors_total",
 		Help:      "The count of errors when adding entries to Redis.",
+	}, []string{"server"})
+
+	cacheCollisions = promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: plugin.Namespace,
+		Subsystem: "redis_cache",
+		Name:      "collisions_total",
+		Help:      "The count of cache hits whose stored question did not match the request.",
+	}, []string{"server"})
+
+	cacheEncodeErrors = promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: plugin.Namespace,
+		Subsystem: "redis_cache",
+		Name:      "encode_errors_total",
+		Help:      "The count of DNS messages that could not be serialized to wire format and so were not cached.",
 	}, []string{"server"})
 )

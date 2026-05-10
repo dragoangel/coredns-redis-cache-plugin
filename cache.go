@@ -1,12 +1,14 @@
+// Package redis_cache implements a CoreDNS plugin that uses a Redis-compatible
+// backend as a shared L2 DNS cache, sitting behind the in-process L1 cache.
 package redis_cache
 
 import (
 	"context"
 	"encoding/binary"
-	"fmt"
-	"hash/fnv"
+	"encoding/hex"
 	"time"
 
+	"github.com/cespare/xxhash/v2"
 	"github.com/coredns/coredns/plugin/pkg/response"
 	"github.com/coredns/coredns/request"
 
@@ -22,37 +24,55 @@ func key(m *dns.Msg, t response.Type, do bool) string {
 	if t == response.OtherError || t == response.Meta || t == response.Update {
 		return ""
 	}
-	return cacheKey(m.Question[0].Name, m.Question[0].Qtype, do)
+	return cacheKey(m.Question[0].Name, m.Question[0].Qclass, m.Question[0].Qtype, do)
 }
 
-var (
-	one  = []byte("1")
-	zero = []byte("0")
-)
-
-// cacheKey computes an FNV-32 hash key from qname, qtype, and DNSSEC DO flag.
-func cacheKey(qname string, qtype uint16, do bool) string {
-	h := fnv.New32()
-
+// cacheKey returns the Redis key for a DNS question, mixing qclass, qtype,
+// the DO flag, and the lowercased qname.
+//
+// Hash choice (compared at ~1M cached entries, the L2's stated sweet spot):
+//
+//	algo        key size       P(≥1 collision)
+//	FNV-32       8 hex / 4 B    ~100% (50% at ~77 K)
+//	xxhash64    16 hex / 8 B    ~3e-8 (50% at ~5.1 B)
+//	xxhash128   32 hex / 16 B   ~3e-27 (effectively zero)
+//
+// xxhash64 is chosen: collisions are statistically irrelevant at any plausible
+// fleet scale, and the post-fetch question check in re.get catches residual
+// collisions, corruption, or version-skew, accounting them via cacheCollisions
+// — so a 128-bit hash buys nothing operationally and FNV-32 is dangerous (the
+// 32-bit space is birthday-bound past ~77 K entries, exploitable as a cross-
+// domain substitution oracle on a shared L2).
+func cacheKey(qname string, qclass, qtype uint16, do bool) string {
+	var hdr [5]byte
+	binary.BigEndian.PutUint16(hdr[0:2], qclass)
+	binary.BigEndian.PutUint16(hdr[2:4], qtype)
 	if do {
-		h.Write(one)
-	} else {
-		h.Write(zero)
+		hdr[4] = 1
 	}
 
-	b := make([]byte, 2)
-	binary.BigEndian.PutUint16(b, qtype)
-	h.Write(b)
+	h := xxhash.New()
+	_, _ = h.Write(hdr[:])
 
-	for i := range qname {
+	// Lowercase qname into a stack buffer to feed the hash in one Write.
+	// DNS names are bounded by 255 bytes (RFC 1035), so 256 is enough.
+	var buf [256]byte
+	n := len(qname)
+	if n > len(buf) {
+		n = len(buf)
+	}
+	for i := 0; i < n; i++ {
 		c := qname[i]
 		if c >= 'A' && c <= 'Z' {
 			c += 'a' - 'A'
 		}
-		h.Write([]byte{c})
+		buf[i] = c
 	}
+	_, _ = h.Write(buf[:n])
 
-	return fmt.Sprintf("%d", h.Sum32())
+	var sum [8]byte
+	binary.BigEndian.PutUint64(sum[:], h.Sum64())
+	return hex.EncodeToString(sum[:])
 }
 
 // ResponseWriter is a response writer that caches the reply message in Redis.
@@ -95,7 +115,7 @@ func (w *ResponseWriter) WriteMsg(res *dns.Msg) error {
 		if w.state.Match(res) {
 			w.set(res, k, mt, duration)
 		} else {
-			cacheDrops.WithLabelValues(w.server).Inc()
+			cacheResponseMismatches.WithLabelValues(w.server).Inc()
 		}
 	}
 
@@ -122,7 +142,17 @@ func (w *ResponseWriter) set(m *dns.Msg, key string, mt response.Type, duration 
 
 	switch mt {
 	case response.NoError, response.Delegation, response.NameError, response.NoData:
-		if err := w.Redis.Add(w.ctx, key, m, duration); err != nil {
+		// Serialize before touching Redis so a malformed message can't poison
+		// the key with an empty value, and so encoding failures are accounted
+		// to encode_errors_total rather than set_errors_total (which is for
+		// Redis-side write failures).
+		wire, err := ToBytes(m)
+		if err != nil {
+			log.Debugf("Failed to serialize DNS message for cache: %s", err)
+			cacheEncodeErrors.WithLabelValues(w.server).Inc()
+			return
+		}
+		if err := w.Add(w.ctx, key, wire, duration); err != nil {
 			log.Debugf("Failed to add response to Redis cache: %s", err)
 			redisErr.WithLabelValues(w.server).Inc()
 		}

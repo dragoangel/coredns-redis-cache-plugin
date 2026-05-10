@@ -1,0 +1,41 @@
+version: "2"
+
+run:
+  timeout: 3m
+
+linters:
+  default: none
+  enable:
+    - errcheck      # unchecked errors
+    - govet         # canonical static analysis
+    - staticcheck   # comprehensive checks (subsumes gosimple/stylecheck in v2)
+    - ineffassign   # ineffectual assignments
+    - unused        # unused code
+    - misspell      # spelling
+    - revive        # style/correctness lints; replaces deprecated golint
+    - gocritic      # opinionated correctness/perf checks
+    - bodyclose     # http response body close (defensive even if unused today)
+
+  exclusions:
+    rules:
+      # Tests can take liberties with errors and short-lived patterns.
+      - path: _test\.go
+        linters:
+          - errcheck
+          - gocritic
+      # CoreDNS plugin convention: parse() uses `for c.Next() {...; return}`
+      # to walk Caddy directives. The loop semantically iterates once per
+      # directive instance; SA4004 reads it as unconditionally terminated.
+      - path: setup\.go
+        text: SA4004
+
+formatters:
+  enable:
+    - gofmt
+    - goimports
+  settings:
+    gofmt:
+      simplify: true
+    goimports:
+      local-prefixes:
+        - github.com/dragoangel/coredns-redis-cache-plugin

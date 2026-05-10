@@ -1,0 +1,61 @@
+# Configuration for the Python `pre-commit` framework (https://pre-commit.com).
+# Install once with:  make hooks   (or: pre-commit install)
+# Run on demand:      pre-commit run --all-files
+#
+# Hooks call `go` and `golangci-lint` directly (cross-platform) rather than
+# `make`, so they work on Linux, macOS, and native Windows alike. The
+# Makefile mirrors these commands for manual use.
+#
+# Bumping rev pins: Dependabot does not track this file. Run
+# `pre-commit autoupdate` periodically, or enable https://pre-commit.ci
+# (free for OSS, opens PRs automatically) — gomod and GitHub Actions
+# are tracked by .github/dependabot.yml.
+
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: check-merge-conflict
+      - id: mixed-line-ending
+      - id: check-added-large-files
+        args: ["--maxkb=512"]
+
+  - repo: local
+    hooks:
+      - id: golangci-lint-fmt
+        name: gofmt / goimports (golangci-lint fmt)
+        entry: golangci-lint fmt --diff
+        language: system
+        files: \.go$
+        pass_filenames: false
+
+      - id: go-vet
+        name: go vet
+        entry: go vet ./...
+        language: system
+        files: \.(go|mod|sum)$
+        pass_filenames: false
+
+      - id: go-mod-tidy
+        name: go mod tidy (check)
+        entry: go mod tidy -diff
+        language: system
+        files: ^(go\.mod|go\.sum)$
+        pass_filenames: false
+
+      - id: go-test
+        name: go test
+        entry: go test ./...
+        language: system
+        files: \.(go|mod|sum)$
+        pass_filenames: false
+
+      - id: golangci-lint
+        name: golangci-lint
+        entry: golangci-lint run ./...
+        language: system
+        files: \.(go|mod|sum)$
+        pass_filenames: false

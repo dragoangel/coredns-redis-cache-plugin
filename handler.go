@@ -24,8 +24,10 @@ func (re *Redis) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *dns.Msg)
 	m := re.get(ctx, state, server)
 	if m != nil {
 		m.SetReply(r)
-		w.WriteMsg(m)
-		return dns.RcodeSuccess, nil
+		// Return the cached Rcode so NXDOMAIN/SERVFAIL show up correctly in
+		// dnstap/metrics, and propagate any WriteMsg error.
+		err := w.WriteMsg(m)
+		return m.Rcode, err
 	}
 
 	crr := &ResponseWriter{
