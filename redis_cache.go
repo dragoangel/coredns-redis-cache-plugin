@@ -10,6 +10,7 @@ import (
 	"github.com/coredns/coredns/request"
 	"github.com/miekg/dns"
 	"github.com/redis/go-redis/v9"
+	"golang.org/x/sync/singleflight"
 )
 
 // Redis is a plugin that looks up responses in a Redis cache and caches replies.
@@ -27,6 +28,14 @@ type Redis struct {
 	// readPool round-robins (random pick) GETs across N>=2 explicit read
 	// replicas. nil for all other modes.
 	readPool *readReplicaPool
+
+	// writeFlight dedupes concurrent Redis SETs for the same cache key.
+	// In a thundering-herd scenario (L1 cache plugin disabled, simultaneous
+	// upstream forwards for the same name) N goroutines would otherwise
+	// each fire their own SET; this collapses them to one without blocking
+	// the DNS hot path — the SET still runs in a fire-and-forget goroutine,
+	// singleflight just stops the redundant Redis traffic.
+	writeFlight singleflight.Group
 
 	pMaxTTL time.Duration // max TTL for positive (success) responses
 	nMaxTTL time.Duration // max TTL for negative (denial) responses
@@ -86,8 +95,6 @@ type Redis struct {
 	tlsVerifyChain    bool   // verify the server certificate chain against trust roots (default true)
 	tlsVerifyHostname bool   // verify the cert SAN/CN matches the dialed hostname (default true)
 
-	// Testing.
-	now func() time.Time
 }
 
 // New returns a new initialized Redis with default settings. Only fields whose
@@ -116,7 +123,6 @@ func New() *Redis {
 		maxRetries:        1, // see docstring above
 		tlsVerifyChain:    true,
 		tlsVerifyHostname: true,
-		now:               time.Now,
 	}
 }
 
@@ -168,28 +174,9 @@ func (re *Redis) connect() error {
 	switch {
 	case len(re.clusterAddrs) > 0:
 		// Cluster mode — single client routes by hash slot across shards.
-		// Note: Redis Cluster only supports DB 0; re.db is intentionally not
-		// passed here, and the parser rejects `db != 0` together with `cluster`.
-		opts := &redis.ClusterOptions{
-			Addrs:           re.clusterAddrs,
-			Username:        re.username,
-			Password:        re.password,
-			MaxRetries:      re.maxRetries,
-			MinRetryBackoff: re.minRetryBackoff,
-			MaxRetryBackoff: re.maxRetryBackoff,
-			DialTimeout:     re.connectTimeout,
-			ReadTimeout:     re.readTimeout,
-			WriteTimeout:    re.writeTimeout,
-			PoolSize:        re.poolSize,
-			MinIdleConns:    re.minIdleConns,
-			MaxIdleConns:    re.maxIdleConns,
-			MaxActiveConns:  re.maxActiveConns,
-			ConnMaxIdleTime: re.connMaxIdleTime,
-			ConnMaxLifetime: re.connMaxLifetime,
-			PoolTimeout:     re.poolTimeout,
-			Dialer:          dial,
-			TLSConfig:       tlsCfg,
-		}
+		// Redis Cluster supports only DB 0; re.db is dropped here and the
+		// parser rejects `db != 0` together with `cluster`.
+		opts := re.clusterOptions(dial, tlsCfg)
 		switch re.readFrom {
 		case "random":
 			opts.ReadOnly = true
@@ -207,137 +194,31 @@ func (re *Redis) connect() error {
 		// Sentinel mode — single FailoverClusterClient handles both writes
 		// (auto-routed to the Sentinel-discovered master) and reads
 		// (RouteRandomly across the Sentinel-discovered replicas). One
-		// Sentinel monitor instead of two, no double `+switch-master`
-		// subscription. The "Cluster" in the name refers to ClusterClient's
-		// routing machinery, not Redis Cluster: NewFailoverClusterClient
-		// supplies a Sentinel-fed ClusterSlots callback, which suppresses
-		// CLUSTER NODES / CLUSTER SLOTS / READONLY emissions to the
-		// non-cluster Redis nodes (see osscluster.go: readOnly is forced
-		// false when ClusterSlots != nil).
-		client := redis.NewFailoverClusterClient(&redis.FailoverOptions{
-			MasterName:       re.masterName,
-			SentinelAddrs:    re.sentinels,
-			SentinelUsername: re.sentinelUsername,
-			SentinelPassword: re.sentinelPassword,
-			Username:         re.username,
-			Password:         re.password,
-			DB:               re.db,
-			RouteRandomly:    true,
-			MaxRetries:       re.maxRetries,
-			MinRetryBackoff:  re.minRetryBackoff,
-			MaxRetryBackoff:  re.maxRetryBackoff,
-			DialTimeout:      re.connectTimeout,
-			ReadTimeout:      re.readTimeout,
-			WriteTimeout:     re.writeTimeout,
-			PoolSize:         re.poolSize,
-			MinIdleConns:     re.minIdleConns,
-			MaxIdleConns:     re.maxIdleConns,
-			MaxActiveConns:   re.maxActiveConns,
-			ConnMaxIdleTime:  re.connMaxIdleTime,
-			ConnMaxLifetime:  re.connMaxLifetime,
-			PoolTimeout:      re.poolTimeout,
-			Dialer:           dial,
-			TLSConfig:        tlsCfg,
-		})
+		// Sentinel monitor, one +switch-master subscription. The "Cluster"
+		// in the name refers to ClusterClient's routing machinery, not Redis
+		// Cluster: NewFailoverClusterClient supplies a Sentinel-fed
+		// ClusterSlots callback, which suppresses CLUSTER NODES / CLUSTER
+		// SLOTS / READONLY emissions to the non-cluster Redis nodes (see
+		// osscluster.go: readOnly is forced false when ClusterSlots != nil).
+		client := redis.NewFailoverClusterClient(re.failoverOptions(dial, tlsCfg))
 		re.writeClient = client
 		re.readClient = client
 	case len(re.readEndpoints) > 0:
-		// Explicit read replica mode
-		re.writeClient = redis.NewClient(&redis.Options{
-			Addr:            re.addr,
-			Username:        re.username,
-			Password:        re.password,
-			DB:              re.db,
-			MaxRetries:      re.maxRetries,
-			MinRetryBackoff: re.minRetryBackoff,
-			MaxRetryBackoff: re.maxRetryBackoff,
-			DialTimeout:     re.connectTimeout,
-			ReadTimeout:     re.readTimeout,
-			WriteTimeout:    re.writeTimeout,
-			PoolSize:        re.poolSize,
-			MinIdleConns:    re.minIdleConns,
-			MaxIdleConns:    re.maxIdleConns,
-			MaxActiveConns:  re.maxActiveConns,
-			ConnMaxIdleTime: re.connMaxIdleTime,
-			ConnMaxLifetime: re.connMaxLifetime,
-			PoolTimeout:     re.poolTimeout,
-			Dialer:          dial,
-			TLSConfig:       tlsCfg,
-		})
-		// One read endpoint → single client; ≥2 → readReplicaPool (random pick per GET).
+		// Explicit-replicas mode: master at re.addr, reads from re.readEndpoints.
+		re.writeClient = redis.NewClient(re.clientOptions(re.addr, dial, tlsCfg))
 		if len(re.readEndpoints) == 1 {
-			re.readClient = redis.NewClient(&redis.Options{
-				Addr:            re.readEndpoints[0],
-				Username:        re.username,
-				Password:        re.password,
-				DB:              re.db,
-				MaxRetries:      re.maxRetries,
-				MinRetryBackoff: re.minRetryBackoff,
-				MaxRetryBackoff: re.maxRetryBackoff,
-				DialTimeout:     re.connectTimeout,
-				ReadTimeout:     re.readTimeout,
-				WriteTimeout:    re.writeTimeout,
-				PoolSize:        re.poolSize,
-				MinIdleConns:    re.minIdleConns,
-				MaxIdleConns:    re.maxIdleConns,
-				MaxActiveConns:  re.maxActiveConns,
-				ConnMaxIdleTime: re.connMaxIdleTime,
-				ConnMaxLifetime: re.connMaxLifetime,
-				PoolTimeout:     re.poolTimeout,
-				Dialer:          dial,
-				TLSConfig:       tlsCfg,
-			})
+			re.readClient = redis.NewClient(re.clientOptions(re.readEndpoints[0], dial, tlsCfg))
 		} else {
-			// Build a per-replica client pool that picks a random replica per GET.
+			// ≥2 read endpoints → readReplicaPool (random pick per GET).
 			clients := make([]*redis.Client, len(re.readEndpoints))
 			for i, ep := range re.readEndpoints {
-				clients[i] = redis.NewClient(&redis.Options{
-					Addr:            ep,
-					Username:        re.username,
-					Password:        re.password,
-					DB:              re.db,
-					MaxRetries:      re.maxRetries,
-					MinRetryBackoff: re.minRetryBackoff,
-					MaxRetryBackoff: re.maxRetryBackoff,
-					DialTimeout:     re.connectTimeout,
-					ReadTimeout:     re.readTimeout,
-					WriteTimeout:    re.writeTimeout,
-					PoolSize:        re.poolSize,
-					MinIdleConns:    re.minIdleConns,
-					MaxIdleConns:    re.maxIdleConns,
-					MaxActiveConns:  re.maxActiveConns,
-					ConnMaxIdleTime: re.connMaxIdleTime,
-					ConnMaxLifetime: re.connMaxLifetime,
-					PoolTimeout:     re.poolTimeout,
-					Dialer:          dial,
-					TLSConfig:       tlsCfg,
-				})
+				clients[i] = redis.NewClient(re.clientOptions(ep, dial, tlsCfg))
 			}
 			re.readPool = &readReplicaPool{clients: clients}
 		}
 	default:
-		// Standalone mode — single client for both reads and writes
-		client := redis.NewClient(&redis.Options{
-			Addr:            re.addr,
-			Username:        re.username,
-			Password:        re.password,
-			DB:              re.db,
-			MaxRetries:      re.maxRetries,
-			MinRetryBackoff: re.minRetryBackoff,
-			MaxRetryBackoff: re.maxRetryBackoff,
-			DialTimeout:     re.connectTimeout,
-			ReadTimeout:     re.readTimeout,
-			WriteTimeout:    re.writeTimeout,
-			PoolSize:        re.poolSize,
-			MinIdleConns:    re.minIdleConns,
-			MaxIdleConns:    re.maxIdleConns,
-			MaxActiveConns:  re.maxActiveConns,
-			ConnMaxIdleTime: re.connMaxIdleTime,
-			ConnMaxLifetime: re.connMaxLifetime,
-			PoolTimeout:     re.poolTimeout,
-			Dialer:          dial,
-			TLSConfig:       tlsCfg,
-		})
+		// Standalone — single client for both reads and writes.
+		client := redis.NewClient(re.clientOptions(re.addr, dial, tlsCfg))
 		re.writeClient = client
 		re.readClient = client
 	}
@@ -347,8 +228,11 @@ func (re *Redis) connect() error {
 		return fmt.Errorf("write endpoint: %w", err)
 	}
 	if re.readClient != nil && re.readClient != re.writeClient {
+		// Reached only in single-read-replica mode, where the address is
+		// known explicitly (re.readEndpoints[0]).
+		readAddr := re.readEndpoints[0]
 		if err := re.readClient.Ping(ctx).Err(); err != nil {
-			log.Warningf("Read endpoint ping failed (will retry on demand): %s", err)
+			log.Warningf("Read endpoint %s ping failed (will retry on demand): %s", readAddr, err)
 		}
 	}
 	if re.readPool != nil {
@@ -405,13 +289,16 @@ func (re *Redis) readPipeline() redis.Pipeliner {
 //   - (nil, nil)  on a cache miss (key not present in Redis)
 //   - (nil, err)  on a read error (network, timeout, protocol)
 func (re *Redis) Get(ctx context.Context, key string) (*dns.Msg, error) {
-	// Pipeline GET and TTL in a single round-trip.
+	// Pipeline GET and TTL in a single round-trip. We deliberately ignore
+	// the aggregate pipe.Exec error and inspect each command separately:
+	// if GET succeeded but TTL failed (server hiccup, mid-pipeline I/O
+	// blip, cluster-edge MOVED-on-TTL), we still have valid bytes and
+	// should serve them with a fallback TTL=0 instead of throwing away
+	// a perfectly good cache hit.
 	pipe := re.readPipeline()
 	getCmd := pipe.Get(ctx, key)
 	ttlCmd := pipe.TTL(ctx, key)
-	if _, err := pipe.Exec(ctx); err != nil && err != redis.Nil {
-		return nil, err
-	}
+	_, _ = pipe.Exec(ctx)
 
 	b, err := getCmd.Bytes()
 	if err == redis.Nil {
@@ -428,8 +315,10 @@ func (re *Redis) Get(ctx context.Context, key string) (*dns.Msg, error) {
 	}
 
 	ttl := 0
-	if d, err := ttlCmd.Result(); err == nil && d > 0 {
+	if d, terr := ttlCmd.Result(); terr == nil && d > 0 {
 		ttl = int(d.Seconds())
+	} else if terr != nil && terr != redis.Nil {
+		log.Debugf("TTL fetch for %s failed (serving with ttl=0): %s", key, terr)
 	}
 
 	m, err := FromBytes(b, ttl)

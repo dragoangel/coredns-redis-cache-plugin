@@ -105,7 +105,7 @@ func parse(c *caddy.Controller) (*Redis, error) {
 					return nil, c.Errf("success: %v", err)
 				}
 				if pttl <= 0 {
-					return nil, fmt.Errorf("cache TTL can not be zero or negative: %s", pttl)
+					return nil, fmt.Errorf("success max TTL must be positive, got %s", pttl)
 				}
 				re.pMaxTTL = pttl
 				if len(args) > 1 {
@@ -114,7 +114,10 @@ func parse(c *caddy.Controller) (*Redis, error) {
 						return nil, c.Errf("success min TTL: %v", err)
 					}
 					if pmin < 0 {
-						return nil, fmt.Errorf("cache min TTL can not be negative: %s", pmin)
+						return nil, fmt.Errorf("success min TTL cannot be negative, got %s", pmin)
+					}
+					if pmin > pttl {
+						return nil, fmt.Errorf("success min TTL (%s) cannot exceed max TTL (%s)", pmin, pttl)
 					}
 					re.pMinTTL = pmin
 				}
@@ -130,7 +133,7 @@ func parse(c *caddy.Controller) (*Redis, error) {
 					return nil, c.Errf("denial: %v", err)
 				}
 				if nttl <= 0 {
-					return nil, fmt.Errorf("cache TTL can not be zero or negative: %s", nttl)
+					return nil, fmt.Errorf("denial max TTL must be positive, got %s", nttl)
 				}
 				re.nMaxTTL = nttl
 				if len(args) > 1 {
@@ -139,7 +142,10 @@ func parse(c *caddy.Controller) (*Redis, error) {
 						return nil, c.Errf("denial min TTL: %v", err)
 					}
 					if nmin < 0 {
-						return nil, fmt.Errorf("cache min TTL can not be negative: %s", nmin)
+						return nil, fmt.Errorf("denial min TTL cannot be negative, got %s", nmin)
+					}
+					if nmin > nttl {
+						return nil, fmt.Errorf("denial min TTL (%s) cannot exceed max TTL (%s)", nmin, nttl)
 					}
 					re.nMinTTL = nmin
 				}

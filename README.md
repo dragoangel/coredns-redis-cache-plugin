@@ -243,13 +243,13 @@ The resulting `coredns` binary now recognizes the `redis_cache` directive in you
 
 ### First-time setup
 
-You need the Go toolchain (version per `go.mod`), `golangci-lint`, and the
-[`pre-commit`](https://pre-commit.com) Python tool.
+You need the Go toolchain (version per `go.mod`), `golangci-lint`, `govulncheck`,
+and the [`pre-commit`](https://pre-commit.com) Python tool.
 
 **Linux/macOS:**
 
 ```sh
-make tools                  # installs golangci-lint at the pinned version
+make tools                  # installs golangci-lint and govulncheck at pinned versions
 pip install --user pre-commit
 make hooks                  # runs `pre-commit install`
 ```
@@ -260,6 +260,9 @@ make hooks                  # runs `pre-commit install`
 winget install GoLang.Go
 winget install GolangCI.golangci-lint
 winget install Python.Python.3
+
+:: govulncheck has no winget package; install via go:
+go install golang.org/x/vuln/cmd/govulncheck@latest
 
 :: pre-commit has no first-party winget package; install via pip:
 pip install --user pre-commit
@@ -287,7 +290,8 @@ make test          # go test ./...
 make test-race     # go test -race ./...
 make lint          # golangci-lint run
 make fmt           # gofmt -s -w .
-make ci            # full pipeline: fmt-check + tidy-check + vet + lint + test-race
+make vuln          # govulncheck ./...
+make ci            # full pipeline: fmt-check + tidy-check + vet + lint + test-race + vuln
 ```
 
 Windows users can call the underlying commands directly (`go test ./...`,

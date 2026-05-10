@@ -89,7 +89,11 @@ type ResponseWriter struct {
 	state request.Request
 	*Redis
 	server string
-	ctx    context.Context
+	// ctx breaks Go's "don't store contexts in structs" idiom on purpose:
+	// dns.ResponseWriter.WriteMsg has no ctx parameter, but we need one for
+	// the async Redis SET fired from WriteMsg. ServeDNS stashes the request
+	// ctx here on the way in; WriteMsg derives a detached child for the SET.
+	ctx context.Context
 }
 
 // WriteMsg implements the dns.ResponseWriter interface.
@@ -108,7 +112,7 @@ type ResponseWriter struct {
 // bound how long the goroutine can run; no extra cap is layered on top.
 func (w *ResponseWriter) WriteMsg(res *dns.Msg) error {
 	do := false
-	mt, opt := response.Typify(res, w.now().UTC())
+	mt, opt := response.Typify(res, time.Now().UTC())
 	if opt != nil {
 		do = opt.Do()
 	}
@@ -156,26 +160,21 @@ func (w *ResponseWriter) WriteMsg(res *dns.Msg) error {
 	}
 
 	// Apply capped TTL to this reply to avoid jarring TTL jumps.
-	ttl := uint32(duration.Seconds())
-	for i := range res.Answer {
-		res.Answer[i].Header().Ttl = ttl
-	}
-	for i := range res.Ns {
-		res.Ns[i].Header().Ttl = ttl
-	}
-	for i := range res.Extra {
-		if res.Extra[i].Header().Rrtype != dns.TypeOPT {
-			res.Extra[i].Header().Ttl = ttl
-		}
-	}
+	setMsgTTL(res, int(duration.Seconds()))
 	err := w.ResponseWriter.WriteMsg(res)
 
 	if wire != nil {
 		go func() {
-			if addErr := w.Add(context.WithoutCancel(w.ctx), k, wire, duration); addErr != nil {
-				log.Debugf("Failed to add response to Redis cache: %s", addErr)
-				redisErr.WithLabelValues(w.server).Inc()
-			}
+			// Single-flight the SET so concurrent goroutines writing the same
+			// key collapse to a single Redis round-trip. Already a goroutine
+			// per call, so waiters here don't block the DNS hot path.
+			_, _, _ = w.writeFlight.Do(k, func() (interface{}, error) {
+				if addErr := w.Add(context.WithoutCancel(w.ctx), k, wire, duration); addErr != nil {
+					log.Debugf("Failed to add response to Redis cache: %s", addErr)
+					cacheSetErrors.WithLabelValues(w.server).Inc()
+				}
+				return nil, nil
+			})
 		}()
 	}
 

@@ -55,6 +55,36 @@ func TestFromBytes_Empty(t *testing.T) {
 	}
 }
 
+// FuzzFromBytes feeds arbitrary byte slices through the unpack path. It must
+// never panic — corrupt or adversarial Redis values are a real possibility
+// (older plugin versions, manual SETs, partial writes), and any panic in
+// FromBytes would crash the whole CoreDNS process.
+//
+// Run locally with: go test -run=^$ -fuzz=FuzzFromBytes -fuzztime=30s
+func FuzzFromBytes(f *testing.F) {
+	// Seed corpus: a valid response, a truncated header, an empty input,
+	// and a few well-known short patterns that have tripped DNS parsers
+	// historically (compression loops, oversized labels).
+	good := new(dns.Msg)
+	good.SetQuestion("example.com.", dns.TypeA)
+	good.Response = true
+	rr, _ := dns.NewRR("example.com. 60 IN A 192.0.2.1")
+	good.Answer = []dns.RR{rr}
+	if b, err := good.Pack(); err == nil {
+		f.Add(b)
+		f.Add(b[:5])  // truncated header
+		f.Add(b[:12]) // exact header, no data
+	}
+	f.Add([]byte{})
+	f.Add([]byte{0, 0})
+	// Compression-pointer loop: name field has a pointer to itself.
+	f.Add([]byte{0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0xc0, 0x0c})
+
+	f.Fuzz(func(_ *testing.T, data []byte) {
+		_, _ = FromBytes(data, 0)
+	})
+}
+
 func TestRoundtripPreservesNXDOMAIN(t *testing.T) {
 	in := new(dns.Msg)
 	in.SetQuestion("nx.example.com.", dns.TypeA)

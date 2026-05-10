@@ -141,6 +141,16 @@ func TestSetup(t *testing.T) {
 			denial 1800 -10
 		}`, true, 0, 0, 0, 0, "", "", "", 0, 0, 0, ""},
 
+		// Error: success min > max (would invert clamp)
+		{`redis_cache {
+			success 30s 1h
+		}`, true, 0, 0, 0, 0, "", "", "", 0, 0, 0, ""},
+
+		// Error: denial min > max (would invert clamp)
+		{`redis_cache {
+			denial 10s 5m
+		}`, true, 0, 0, 0, 0, "", "", "", 0, 0, 0, ""},
+
 		// min of 0 is valid (means no floor)
 		{`redis_cache {
 			success 3600 0
