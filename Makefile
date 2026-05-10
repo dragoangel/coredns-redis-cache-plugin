@@ -45,11 +45,9 @@ tidy: ## Run go mod tidy.
 
 .PHONY: tidy-check
 tidy-check: ## Verify go.mod / go.sum are tidy.
-	@diff=$$($(GO) mod tidy -diff 2>&1) ; \
-	if [ -n "$$diff" ]; then \
-		echo "go.mod is not tidy:" >&2; echo "$$diff" >&2; \
-		echo "Run 'make tidy' to fix." >&2; exit 1; \
-	fi
+	@$(GO) mod tidy -diff || { \
+		echo "go.mod is not tidy. Run 'make tidy' to fix." >&2; exit 1; \
+	}
 
 .PHONY: cover
 cover: ## Run tests with a coverage report.
