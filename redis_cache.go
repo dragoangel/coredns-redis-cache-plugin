@@ -1,0 +1,435 @@
+package redis_cache
+
+import (
+	"context"
+	"fmt"
+	"net"
+	"time"
+
+	"github.com/coredns/coredns/plugin"
+	"github.com/coredns/coredns/request"
+	"github.com/miekg/dns"
+	"github.com/redis/go-redis/v9"
+)
+
+// Redis is a plugin that looks up responses in a Redis cache and caches replies.
+// It has a success and a denial of existence cache.
+type Redis struct {
+	Next  plugin.Handler
+	Zones []string
+
+	// writeClient routes to the master (or standalone) for SET operations.
+	writeClient redis.UniversalClient
+	// readClient routes to a replica (or the same client) for GET operations.
+	readClient redis.UniversalClient
+
+	pMaxTTL    time.Duration // max TTL for positive (success) responses
+	nMaxTTL    time.Duration // max TTL for negative (denial) responses
+	pMinTTL time.Duration // min TTL for positive responses (floor)
+	nMinTTL time.Duration // min TTL for negative responses (floor)
+
+	// Connection config
+	addr          string   // standalone write endpoint (default 127.0.0.1:6379)
+	endpointSet   bool     // true if 'endpoint' was set explicitly (used to detect mode conflicts)
+	username      string   // ACL username for the data plane (primary/replicas/cluster), Redis 6+, optional
+	password      string   // AUTH password for the data plane, optional
+	readEndpoints []string // explicit read-only replica endpoints
+
+	// Timeouts
+	connectTimeout time.Duration // TCP dial timeout (default 1s)
+	readTimeout    time.Duration // per-command read timeout (default 1s)
+	writeTimeout   time.Duration // per-command write timeout (default 2s)
+
+	// Database index (0 = default DB; only meaningful in non-cluster modes)
+	db int
+
+	// Connection pool — all 0 = leave at go-redis default (see README)
+	poolSize        int           // PoolSize: max sockets per client
+	minIdleConns    int           // MinIdleConns: warm pool floor
+	maxIdleConns    int           // MaxIdleConns: cap on idle sockets
+	maxActiveConns  int           // MaxActiveConns: hard cap on total open sockets
+	connMaxIdleTime time.Duration // ConnMaxIdleTime: close after this much idle
+	connMaxLifetime time.Duration // ConnMaxLifetime: forced recycle after this lifetime
+	poolTimeout     time.Duration // PoolTimeout: how long to wait when pool is exhausted
+
+	// Retries — see New() for plugin default rationale
+	maxRetries      int           // MaxRetries: -1=disabled, 0=go-redis default (3), N>0=explicit
+	minRetryBackoff time.Duration // MinRetryBackoff between retries (0 = go-redis default 8ms)
+	maxRetryBackoff time.Duration // MaxRetryBackoff between retries (0 = go-redis default 512ms)
+
+	// Network tuning
+	tcpKeepalive time.Duration // net.Dialer.KeepAlive interval (0 = OS default)
+
+	// DNS resolver for Redis hostnames (bypasses system resolver to avoid circular deps)
+	resolver string // DNS server address for resolving Redis hostnames (e.g. "10.96.0.10:53")
+
+	// Sentinel config
+	sentinels        []string // sentinel addresses
+	masterName       string   // sentinel master name (master group name)
+	sentinelUsername string   // ACL username for the Sentinel API, Redis 6.2+, optional
+	sentinelPassword string   // AUTH password for the Sentinel API, optional
+
+	// Cluster config
+	clusterAddrs []string // cluster seed nodes
+	readFrom     string   // replica routing strategy: latency|random|primary ("" = latency)
+
+	// TLS config (shared by data-plane and Sentinel API connections)
+	tlsEnabled        bool   // true if any tls* directive was set
+	tlsCert           string // PEM-encoded client certificate file (for mTLS)
+	tlsKey            string // PEM-encoded client private key file (for mTLS)
+	tlsCA             string // PEM-encoded CA file replacing OS trust store, optional
+	tlsVerifyChain    bool   // verify the server certificate chain against trust roots (default true)
+	tlsVerifyHostname bool   // verify the cert SAN/CN matches the dialed hostname (default true)
+
+	// Testing.
+	now func() time.Time
+}
+
+// New returns a new initialized Redis with default settings. Only fields whose
+// zero value is unsuitable as a default are populated here — everything else
+// stays at its struct zero so user-supplied directives win and unset knobs
+// flow through to go-redis's own documented defaults (see README).
+//
+// Plugin-specific default override: maxRetries is set to 1 rather than letting
+// go-redis's default of 3 kick in. As an L2 cache the plugin should noop quickly
+// on any sustained Redis problem — three retries with backoff can stretch a
+// single DNS query to ~half a second of cache-side waiting, which defeats the
+// design. One retry absorbs an isolated dropped packet / transient blip without
+// amplifying an outage. Operators tune via the `retries` directive (use -1 to
+// disable retries entirely).
+func New() *Redis {
+	return &Redis{
+		Zones:             []string{"."},
+		addr:              "127.0.0.1:6379",
+		pMaxTTL:           maxTTL,
+		nMaxTTL:           maxNTTL,
+		connectTimeout:    defaultConnectTimeout,
+		readTimeout:       defaultReadTimeout,
+		writeTimeout:      defaultWriteTimeout,
+		maxRetries:        1, // see docstring above
+		tlsVerifyChain:    true,
+		tlsVerifyHostname: true,
+		now:               time.Now,
+	}
+}
+
+// connect establishes Redis clients based on configuration.
+// It supports three modes:
+//  1. Sentinel: automatic master/replica discovery via Redis Sentinel.
+//  2. Explicit replicas: endpoint for writes + read_endpoint(s) for reads.
+//  3. Standalone: single endpoint for both reads and writes.
+// dialer returns a custom net.Dialer's DialContext when either a custom
+// resolver or a TCP keepalive interval is configured. Otherwise it returns
+// nil, letting go-redis fall back to its built-in dialer.
+//
+// Custom resolver: avoids circular DNS dependencies when node-local-dns
+// intercepts the DNS VIP — Redis hostnames are resolved via the upstream
+// kube-dns instead of the system resolver.
+//
+// TCP keepalive: probes idle connections so NAT / load-balancer / sidecar
+// timeouts don't silently kill them.
+func (re *Redis) dialer() func(ctx context.Context, network, addr string) (net.Conn, error) {
+	if re.resolver == "" && re.tcpKeepalive == 0 {
+		return nil
+	}
+	d := &net.Dialer{
+		Timeout:   re.connectTimeout,
+		KeepAlive: re.tcpKeepalive, // 0 = use Go default keepalive
+	}
+	if re.resolver != "" {
+		d.Resolver = &net.Resolver{
+			PreferGo: true,
+			Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
+				inner := net.Dialer{Timeout: re.connectTimeout}
+				return inner.DialContext(ctx, "udp", re.resolver)
+			},
+		}
+	}
+	return d.DialContext
+}
+
+func (re *Redis) connect() error {
+	ctx := context.Background()
+	dial := re.dialer()
+
+	tlsCfg, err := re.buildTLSConfig()
+	if err != nil {
+		return fmt.Errorf("tls: %w", err)
+	}
+
+	if len(re.clusterAddrs) > 0 {
+		// Cluster mode — single client routes by hash slot across shards.
+		// Note: Redis Cluster only supports DB 0; re.db is intentionally not
+		// passed here, and the parser rejects `db != 0` together with `cluster`.
+		opts := &redis.ClusterOptions{
+			Addrs:           re.clusterAddrs,
+			Username:        re.username,
+			Password:        re.password,
+			MaxRetries:      re.maxRetries,
+			MinRetryBackoff: re.minRetryBackoff,
+			MaxRetryBackoff: re.maxRetryBackoff,
+			DialTimeout:     re.connectTimeout,
+			ReadTimeout:     re.readTimeout,
+			WriteTimeout:    re.writeTimeout,
+			PoolSize:        re.poolSize,
+			MinIdleConns:    re.minIdleConns,
+			MaxIdleConns:    re.maxIdleConns,
+			MaxActiveConns:  re.maxActiveConns,
+			ConnMaxIdleTime: re.connMaxIdleTime,
+			ConnMaxLifetime: re.connMaxLifetime,
+			PoolTimeout:     re.poolTimeout,
+			Dialer:          dial,
+			TLSConfig:       tlsCfg,
+		}
+		switch re.readFrom {
+		case "random":
+			opts.ReadOnly = true
+			opts.RouteRandomly = true
+		case "primary":
+			// reads stay on primaries
+		default: // "" or "latency"
+			opts.ReadOnly = true
+			opts.RouteByLatency = true
+		}
+		client := redis.NewClusterClient(opts)
+		re.writeClient = client
+		re.readClient = client
+	} else if re.masterName != "" {
+		// Sentinel mode
+		re.writeClient = redis.NewFailoverClient(&redis.FailoverOptions{
+			MasterName:       re.masterName,
+			SentinelAddrs:    re.sentinels,
+			SentinelUsername: re.sentinelUsername,
+			SentinelPassword: re.sentinelPassword,
+			Username:         re.username,
+			Password:         re.password,
+			DB:               re.db,
+			MaxRetries:       re.maxRetries,
+			MinRetryBackoff:  re.minRetryBackoff,
+			MaxRetryBackoff:  re.maxRetryBackoff,
+			DialTimeout:      re.connectTimeout,
+			ReadTimeout:      re.readTimeout,
+			WriteTimeout:     re.writeTimeout,
+			PoolSize:         re.poolSize,
+			MinIdleConns:     re.minIdleConns,
+			MaxIdleConns:     re.maxIdleConns,
+			MaxActiveConns:   re.maxActiveConns,
+			ConnMaxIdleTime:  re.connMaxIdleTime,
+			ConnMaxLifetime:  re.connMaxLifetime,
+			PoolTimeout:      re.poolTimeout,
+			Dialer:           dial,
+			TLSConfig:        tlsCfg,
+		})
+		re.readClient = redis.NewFailoverClient(&redis.FailoverOptions{
+			MasterName:       re.masterName,
+			SentinelAddrs:    re.sentinels,
+			SentinelUsername: re.sentinelUsername,
+			SentinelPassword: re.sentinelPassword,
+			Username:         re.username,
+			Password:         re.password,
+			DB:               re.db,
+			ReplicaOnly:      true,
+			MaxRetries:       re.maxRetries,
+			MinRetryBackoff:  re.minRetryBackoff,
+			MaxRetryBackoff:  re.maxRetryBackoff,
+			DialTimeout:      re.connectTimeout,
+			ReadTimeout:      re.readTimeout,
+			WriteTimeout:     re.writeTimeout,
+			PoolSize:         re.poolSize,
+			MinIdleConns:     re.minIdleConns,
+			MaxIdleConns:     re.maxIdleConns,
+			MaxActiveConns:   re.maxActiveConns,
+			ConnMaxIdleTime:  re.connMaxIdleTime,
+			ConnMaxLifetime:  re.connMaxLifetime,
+			PoolTimeout:      re.poolTimeout,
+			Dialer:           dial,
+			TLSConfig:        tlsCfg,
+		})
+	} else if len(re.readEndpoints) > 0 {
+		// Explicit read replica mode
+		re.writeClient = redis.NewClient(&redis.Options{
+			Addr:            re.addr,
+			Username:        re.username,
+			Password:        re.password,
+			DB:              re.db,
+			MaxRetries:      re.maxRetries,
+			MinRetryBackoff: re.minRetryBackoff,
+			MaxRetryBackoff: re.maxRetryBackoff,
+			DialTimeout:     re.connectTimeout,
+			ReadTimeout:     re.readTimeout,
+			WriteTimeout:    re.writeTimeout,
+			PoolSize:        re.poolSize,
+			MinIdleConns:    re.minIdleConns,
+			MaxIdleConns:    re.maxIdleConns,
+			MaxActiveConns:  re.maxActiveConns,
+			ConnMaxIdleTime: re.connMaxIdleTime,
+			ConnMaxLifetime: re.connMaxLifetime,
+			PoolTimeout:     re.poolTimeout,
+			Dialer:          dial,
+			TLSConfig:       tlsCfg,
+		})
+		// Use a ring client if multiple read endpoints, otherwise a single client
+		if len(re.readEndpoints) == 1 {
+			re.readClient = redis.NewClient(&redis.Options{
+				Addr:            re.readEndpoints[0],
+				Username:        re.username,
+				Password:        re.password,
+				DB:              re.db,
+				MaxRetries:      re.maxRetries,
+				MinRetryBackoff: re.minRetryBackoff,
+				MaxRetryBackoff: re.maxRetryBackoff,
+				DialTimeout:     re.connectTimeout,
+				ReadTimeout:     re.readTimeout,
+				WriteTimeout:    re.writeTimeout,
+				PoolSize:        re.poolSize,
+				MinIdleConns:    re.minIdleConns,
+				MaxIdleConns:    re.maxIdleConns,
+				MaxActiveConns:  re.maxActiveConns,
+				ConnMaxIdleTime: re.connMaxIdleTime,
+				ConnMaxLifetime: re.connMaxLifetime,
+				PoolTimeout:     re.poolTimeout,
+				Dialer:          dial,
+				TLSConfig:       tlsCfg,
+			})
+		} else {
+			shards := make(map[string]string, len(re.readEndpoints))
+			for i, ep := range re.readEndpoints {
+				shards[fmt.Sprintf("replica%d", i)] = ep
+			}
+			re.readClient = redis.NewRing(&redis.RingOptions{
+				Addrs:           shards,
+				Username:        re.username,
+				Password:        re.password,
+				DB:              re.db,
+				MaxRetries:      re.maxRetries,
+				MinRetryBackoff: re.minRetryBackoff,
+				MaxRetryBackoff: re.maxRetryBackoff,
+				DialTimeout:     re.connectTimeout,
+				ReadTimeout:     re.readTimeout,
+				WriteTimeout:    re.writeTimeout,
+				PoolSize:        re.poolSize,
+				MinIdleConns:    re.minIdleConns,
+				MaxIdleConns:    re.maxIdleConns,
+				MaxActiveConns:  re.maxActiveConns,
+				ConnMaxIdleTime: re.connMaxIdleTime,
+				ConnMaxLifetime: re.connMaxLifetime,
+				PoolTimeout:     re.poolTimeout,
+				Dialer:          dial,
+				TLSConfig:       tlsCfg,
+			})
+		}
+	} else {
+		// Standalone mode — single client for both reads and writes
+		client := redis.NewClient(&redis.Options{
+			Addr:            re.addr,
+			Username:        re.username,
+			Password:        re.password,
+			DB:              re.db,
+			MaxRetries:      re.maxRetries,
+			MinRetryBackoff: re.minRetryBackoff,
+			MaxRetryBackoff: re.maxRetryBackoff,
+			DialTimeout:     re.connectTimeout,
+			ReadTimeout:     re.readTimeout,
+			WriteTimeout:    re.writeTimeout,
+			PoolSize:        re.poolSize,
+			MinIdleConns:    re.minIdleConns,
+			MaxIdleConns:    re.maxIdleConns,
+			MaxActiveConns:  re.maxActiveConns,
+			ConnMaxIdleTime: re.connMaxIdleTime,
+			ConnMaxLifetime: re.connMaxLifetime,
+			PoolTimeout:     re.poolTimeout,
+			Dialer:          dial,
+			TLSConfig:       tlsCfg,
+		})
+		re.writeClient = client
+		re.readClient = client
+	}
+
+	// Verify connectivity
+	if err := re.writeClient.Ping(ctx).Err(); err != nil {
+		return fmt.Errorf("write endpoint: %w", err)
+	}
+	if re.readClient != re.writeClient {
+		if err := re.readClient.Ping(ctx).Err(); err != nil {
+			log.Warningf("Read endpoint ping failed (will retry on demand): %s", err)
+		}
+	}
+
+	return nil
+}
+
+// close shuts down Redis clients.
+func (re *Redis) close() error {
+	var errs []error
+	if re.writeClient != nil {
+		if err := re.writeClient.Close(); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	if re.readClient != nil && re.readClient != re.writeClient {
+		if err := re.readClient.Close(); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	if len(errs) > 0 {
+		return fmt.Errorf("close errors: %v", errs)
+	}
+	return nil
+}
+
+// Add stores the DNS message m under the given key in Redis with the specified duration.
+// Writes always go to the master/write client.
+func (re *Redis) Add(ctx context.Context, key string, m *dns.Msg, duration time.Duration) error {
+	return re.writeClient.Set(ctx, key, ToString(m), duration).Err()
+}
+
+// Get retrieves a cached DNS message by key from a read replica. Returns:
+//   - (msg, nil)  on a cache hit
+//   - (nil, nil)  on a cache miss (key not present in Redis)
+//   - (nil, err)  on a read error (network, timeout, protocol)
+func (re *Redis) Get(ctx context.Context, key string) (*dns.Msg, error) {
+	// Pipeline GET and TTL in a single round-trip.
+	pipe := re.readClient.Pipeline()
+	getCmd := pipe.Get(ctx, key)
+	ttlCmd := pipe.TTL(ctx, key)
+	if _, err := pipe.Exec(ctx); err != nil && err != redis.Nil {
+		return nil, err
+	}
+
+	s, err := getCmd.Result()
+	if err == redis.Nil {
+		return nil, nil // miss
+	}
+	if err != nil {
+		return nil, err
+	}
+	if s == "" {
+		return nil, nil // empty value — treat as miss
+	}
+
+	ttl := 0
+	if d, err := ttlCmd.Result(); err == nil && d > 0 {
+		ttl = int(d.Seconds())
+	}
+
+	return FromString(s, ttl), nil
+}
+
+// get looks up a cached response for the given request.
+func (re *Redis) get(ctx context.Context, state request.Request, server string) *dns.Msg {
+	k := cacheKey(state.Name(), state.QType(), state.Do())
+
+	m, err := re.Get(ctx, k)
+	if err != nil {
+		log.Warningf("Redis cache read error for %s: %s", state.Name(), err)
+		cacheReadErrors.WithLabelValues(server).Inc()
+		return nil
+	}
+	if m == nil {
+		cacheMisses.WithLabelValues(server).Inc()
+		return nil
+	}
+	log.Debugf("Returning response from Redis cache: %s for %s", m.Question[0].Name, state.Name())
+	cacheHits.WithLabelValues(server).Inc()
+	return m
+}
