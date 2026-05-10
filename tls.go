@@ -65,7 +65,7 @@ func (re *Redis) buildTLSConfig() (*tls.Config, error) {
 		// so we disable the built-in verifier and run the chain verification ourselves
 		// without the DNSName option.
 		cfg.InsecureSkipVerify = true //nolint:gosec // chain still validated below
-		roots := cfg.RootCAs            // nil ⇒ system trust
+		roots := cfg.RootCAs          // nil ⇒ system trust
 		cfg.VerifyConnection = func(cs tls.ConnectionState) error {
 			if len(cs.PeerCertificates) == 0 {
 				return fmt.Errorf("tls: server presented no certificate")

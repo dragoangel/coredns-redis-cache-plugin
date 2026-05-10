@@ -247,6 +247,70 @@ go build
 
 The resulting `coredns` binary now recognizes the `redis_cache` directive in your Corefile.
 
+## Development
+
+### First-time setup
+
+You need the Go toolchain (version per `go.mod`), `golangci-lint`, and the
+[`pre-commit`](https://pre-commit.com) Python tool.
+
+**Linux/macOS:**
+
+```sh
+make tools                  # installs golangci-lint at the pinned version
+pip install --user pre-commit
+make hooks                  # runs `pre-commit install`
+```
+
+**Windows** (winget is built into Windows 10/11):
+
+```cmd
+winget install GoLang.Go
+winget install GolangCI.golangci-lint
+winget install Python.Python.3
+
+:: pre-commit has no first-party winget package; install via pip:
+pip install --user pre-commit
+
+:: register the hooks
+pre-commit install
+```
+
+After installing tools via winget, **close and reopen the terminal** so the
+updated `PATH` is picked up. If `pre-commit` is still not found, add
+`%APPDATA%\Python\Python3XX\Scripts` (replace `3XX` with your installed
+version, see `where python`) to your user `PATH`.
+
+From this point every `git commit` runs `gofmt`/`goimports`, `go vet`,
+`go mod tidy`, the test suite, and `golangci-lint`. The hooks invoke `go`
+and `golangci-lint` directly, so they work on Linux, macOS, and native
+Windows without `make` or a POSIX shell.
+
+### Day-to-day
+
+The `Makefile` wraps the canonical commands for Linux/macOS users. Run
+`make help` for the full list. Common targets:
+
+```sh
+make test          # go test ./...
+make test-race     # go test -race ./...
+make lint          # golangci-lint run
+make fmt           # gofmt -s -w .
+make ci            # full pipeline: fmt-check + tidy-check + vet + lint + test-race
+```
+
+Windows users can call the underlying commands directly (`go test ./...`,
+`golangci-lint run ./...`, `go vet ./...`, …) or run
+`pre-commit run --all-files` for the same pipeline pre-commit enforces on
+commit.
+
+### Automation
+
+CI (`.github/workflows/ci.yml`) runs the same checks on push and PR.
+Dependency bumps are tracked by Dependabot (`gomod` + `github-actions`,
+weekly, grouped). Pre-commit hook pins are bumped via
+`pre-commit autoupdate` or [pre-commit.ci](https://pre-commit.ci).
+
 ## Metrics
 
 If monitoring is enabled (via the *prometheus* directive) then the following metrics are exported:
@@ -255,7 +319,9 @@ If monitoring is enabled (via the *prometheus* directive) then the following met
 * `coredns_redis_cache_misses_total{server}` — The count of cache misses from Redis.
 * `coredns_redis_cache_get_errors_total{server}` — The count of errors when reading entries from Redis.
 * `coredns_redis_cache_set_errors_total{server}` — The count of errors when adding entries to Redis.
-* `coredns_redis_cache_drops_total{server}` — The count of responses not cached because the reply's question doesn't match the request.
+* `coredns_redis_cache_encode_errors_total{server}` — The count of DNS messages that could not be serialized to wire format and so were not cached.
+* `coredns_redis_cache_response_mismatches_total{server}` — The count of upstream replies whose question did not match the original request and were therefore refused for caching (the reply itself is still passed to the client). Non-zero suggests a misbehaving forwarder upstream or an attempted cache-poisoning probe.
+* `coredns_redis_cache_collisions_total{server}` — The count of cache hits whose stored question did not match the request (treated as a miss; non-zero indicates corruption, version skew, or — extremely unlikely — a 64-bit key hash collision).
 
 ## Examples
 
