@@ -86,4 +86,27 @@ hooks-uninstall: ## Uninstall pre-commit hooks.
 hooks-run: ## Run all pre-commit hooks against the whole tree (CI-style).
 	pre-commit run --all-files
 
+.PHONY: release
+release: ## Tag a release. Usage: make release VERSION=vX.Y.Z
+	@if [ -z "$(VERSION)" ]; then \
+		echo "Usage: make release VERSION=vX.Y.Z (semver, e.g. v0.1.0)" >&2; exit 1; \
+	fi
+	@case "$(VERSION)" in \
+		v[0-9]*.[0-9]*.[0-9]*) ;; \
+		*) echo "VERSION must be vMAJOR.MINOR.PATCH (e.g. v0.1.0)" >&2; exit 1 ;; \
+	esac
+	@if [ -n "$$(git status --porcelain)" ]; then \
+		echo "Working tree is dirty. Commit or stash first." >&2; exit 1; \
+	fi
+	@if git rev-parse "$(VERSION)" >/dev/null 2>&1; then \
+		echo "Tag $(VERSION) already exists." >&2; exit 1; \
+	fi
+	$(MAKE) ci
+	git tag -a "$(VERSION)" -m "Release $(VERSION)"
+	@echo
+	@echo "Tagged $(VERSION) locally. To publish:"
+	@echo "    git push origin $(VERSION)"
+	@echo
+	@echo "The Go module proxy will index the tag once it reaches the remote."
+
 .DEFAULT_GOAL := help
