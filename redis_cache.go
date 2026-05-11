@@ -11,6 +11,7 @@ import (
 	"github.com/miekg/dns"
 	"github.com/redis/go-redis/v9"
 	"golang.org/x/sync/singleflight"
+	"golang.org/x/time/rate"
 )
 
 // Redis is a plugin that looks up responses in a Redis cache and caches replies.
@@ -37,10 +38,29 @@ type Redis struct {
 	// singleflight just stops the redundant Redis traffic.
 	writeFlight singleflight.Group
 
+	// evictFlight dedupes concurrent EXPIRE 0 calls on the same key from
+	// the read-side self-heal path (collision / decode error / empty value).
+	// Without this, a hot poisoned key triggers an evict goroutine per hit
+	// until the first one lands.
+	evictFlight singleflight.Group
+
+	// readErrLog throttles the Warningf for Redis read errors to at most
+	// one per second. Without throttling, a fleet-scale Redis outage
+	// turns into tens of thousands of identical warning lines per second;
+	// the cacheReadErrors counter still increments on every error so
+	// volume is preserved in metrics.
+	readErrLog rate.Sometimes
+
 	pMaxTTL time.Duration // max TTL for positive (success) responses
 	nMaxTTL time.Duration // max TTL for negative (denial) responses
 	pMinTTL time.Duration // min TTL for positive responses (floor)
 	nMinTTL time.Duration // min TTL for negative responses (floor)
+
+	// keyPrefix isolates this plugin's keys from anything else sharing the
+	// Redis namespace. Default "cdrc"; cacheKey() formats keys as
+	// "<keyPrefix>:<hex>". An explicit empty string disables the prefix
+	// (and the colon) for operators who manage isolation out-of-band.
+	keyPrefix string
 
 	// Connection config
 	addr          string   // standalone write endpoint (default 127.0.0.1:6379)
@@ -94,7 +114,6 @@ type Redis struct {
 	tlsCA             string // PEM-encoded CA file replacing OS trust store, optional
 	tlsVerifyChain    bool   // verify the server certificate chain against trust roots (default true)
 	tlsVerifyHostname bool   // verify the cert SAN/CN matches the dialed hostname (default true)
-
 }
 
 // New returns a new initialized Redis with default settings. Only fields whose
@@ -123,6 +142,8 @@ func New() *Redis {
 		maxRetries:        1, // see docstring above
 		tlsVerifyChain:    true,
 		tlsVerifyHostname: true,
+		keyPrefix:         defaultKeyPrefix,
+		readErrLog:        rate.Sometimes{Interval: time.Second},
 	}
 }
 
@@ -177,16 +198,7 @@ func (re *Redis) connect() error {
 		// Redis Cluster supports only DB 0; re.db is dropped here and the
 		// parser rejects `db != 0` together with `cluster`.
 		opts := re.clusterOptions(dial, tlsCfg)
-		switch re.readFrom {
-		case "random":
-			opts.ReadOnly = true
-			opts.RouteRandomly = true
-		case "primary":
-			// reads stay on primaries
-		default: // "" or "latency"
-			opts.ReadOnly = true
-			opts.RouteByLatency = true
-		}
+		applyClusterReadRouting(opts, re.readFrom)
 		client := redis.NewClusterClient(opts)
 		re.writeClient = client
 		re.readClient = client
@@ -289,6 +301,13 @@ func (re *Redis) readPipeline() redis.Pipeliner {
 //   - (nil, nil)  on a cache miss (key not present in Redis)
 //   - (nil, err)  on a read error (network, timeout, protocol)
 func (re *Redis) Get(ctx context.Context, key string) (*dns.Msg, error) {
+	// Bound the whole read path (pool wait + write + read + retries) by a
+	// single readTimeout. Without this, a stalled Redis can chain
+	// pool-wait + retries × per-command timeouts and stretch a DNS reply
+	// well past what the README promises.
+	ctx, cancel := context.WithTimeout(ctx, re.readTimeout)
+	defer cancel()
+
 	// Pipeline GET and TTL in a single round-trip. We deliberately ignore
 	// the aggregate pipe.Exec error and inspect each command separately:
 	// if GET succeeded but TTL failed (server hiccup, mid-pipeline I/O
@@ -314,9 +333,11 @@ func (re *Redis) Get(ctx context.Context, key string) (*dns.Msg, error) {
 		return nil, nil
 	}
 
-	ttl := 0
+	var ttl uint32
 	if d, terr := ttlCmd.Result(); terr == nil && d > 0 {
-		ttl = int(d.Seconds())
+		// time.Duration.Seconds() is float64; uint32 covers ~136 years, well
+		// beyond any plausible DNS TTL, so the truncating cast is safe.
+		ttl = uint32(d.Seconds())
 	} else if terr != nil && terr != redis.Nil {
 		log.Debugf("TTL fetch for %s failed (serving with ttl=0): %s", key, terr)
 	}
@@ -335,11 +356,23 @@ func (re *Redis) Get(ctx context.Context, key string) (*dns.Msg, error) {
 // keeps Redis's main thread free) on a detected-broken entry. Without it,
 // every hit on the orphan re-trips the same bad read and bumps its error
 // counter — one bad key would read as a fleet-wide incident in monitoring.
+//
+// Concurrent calls for the same key collapse via evictFlight so a hot
+// poisoned key produces one EXPIRE, not one per hit until the first lands.
+// recover() guards against a panic in the redis client crashing CoreDNS.
 func (re *Redis) evictAsync(parent context.Context, key string) {
 	go func() {
-		if err := re.writeClient.Expire(context.WithoutCancel(parent), key, 0).Err(); err != nil {
-			log.Debugf("Failed to evict cache key %s: %s", key, err)
-		}
+		defer func() {
+			if r := recover(); r != nil {
+				log.Errorf("panic in evictAsync for %s: %v", key, r)
+			}
+		}()
+		_, _, _ = re.evictFlight.Do(key, func() (interface{}, error) {
+			if err := re.writeClient.Expire(context.WithoutCancel(parent), key, 0).Err(); err != nil {
+				log.Debugf("Failed to evict cache key %s: %s", key, err)
+			}
+			return nil, nil
+		})
 	}()
 }
 
@@ -348,12 +381,16 @@ func (re *Redis) evictAsync(parent context.Context, key string) {
 // depth against corrupted entries or version-skewed encodings; a mismatch is
 // reported via cacheCollisions and treated as a miss.
 func (re *Redis) get(ctx context.Context, state request.Request, server string) *dns.Msg {
-	k := cacheKey(state.Name(), state.QClass(), state.QType(), state.Do())
+	k := cacheKey(re.keyPrefix, state.Name(), state.QClass(), state.QType(), state.Do())
 
 	m, err := re.Get(ctx, k)
 	if err != nil {
-		log.Warningf("Redis cache read error for %s: %s", state.Name(), err)
+		// Counter increments unconditionally; the log line is throttled to
+		// avoid drowning log pipelines during a Redis outage.
 		cacheReadErrors.WithLabelValues(server).Inc()
+		re.readErrLog.Do(func() {
+			log.Warningf("Redis cache read error for %s: %s", state.Name(), err)
+		})
 		return nil
 	}
 	if m == nil {

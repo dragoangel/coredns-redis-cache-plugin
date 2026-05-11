@@ -1,6 +1,7 @@
 package redis_cache
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/miekg/dns"
@@ -106,5 +107,51 @@ func TestRoundtripPreservesNXDOMAIN(t *testing.T) {
 	}
 	if out.Rcode != dns.RcodeNameError {
 		t.Fatalf("Rcode lost in roundtrip: got %d", out.Rcode)
+	}
+}
+
+func TestRoundtrip_LargeMultiSegmentTXT(t *testing.T) {
+	// DKIM / SPF / DMARC records routinely exceed 255 bytes and are split
+	// into multiple TXT-segments per RFC 1035 (each segment ≤255 bytes,
+	// total RDATA up to 65535 — uint16 rdlength). Push close to that
+	// upper bound to prove ToBytes/FromBytes handle the full RFC range,
+	// not just the per-segment limit our encode-error test brushes
+	// against.
+	const segLen = 255
+	const segments = 250 // 250 × (1 length byte + 255 data) ≈ 64000 B rdata
+	txt := make([]string, segments)
+	for i := range txt {
+		txt[i] = strings.Repeat("a", segLen)
+	}
+
+	in := new(dns.Msg)
+	in.SetQuestion("_dkim.example.com.", dns.TypeTXT)
+	in.Response = true
+	in.Answer = []dns.RR{
+		&dns.TXT{
+			Hdr: dns.RR_Header{Name: "_dkim.example.com.", Rrtype: dns.TypeTXT, Class: dns.ClassINET, Ttl: 60},
+			Txt: txt,
+		},
+	}
+
+	b, err := ToBytes(in)
+	if err != nil {
+		t.Fatalf("ToBytes on %d-segment TXT: %v", segments, err)
+	}
+	out, err := FromBytes(b, 30)
+	if err != nil {
+		t.Fatalf("FromBytes: %v", err)
+	}
+	rr, ok := out.Answer[0].(*dns.TXT)
+	if !ok {
+		t.Fatalf("expected *dns.TXT, got %T", out.Answer[0])
+	}
+	if len(rr.Txt) != segments {
+		t.Fatalf("segment count lost in roundtrip: got %d, want %d", len(rr.Txt), segments)
+	}
+	for i, s := range rr.Txt {
+		if len(s) != segLen {
+			t.Fatalf("segment %d length: got %d, want %d", i, len(s), segLen)
+		}
 	}
 }

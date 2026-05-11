@@ -81,7 +81,7 @@ func setup(c *caddy.Controller) error {
 func parse(c *caddy.Controller) (*Redis, error) {
 	re := New()
 
-	for c.Next() {
+	if c.Next() {
 		// Positional args, if provided, fully replace the server-block zones
 		// (TTL is configured via `success` / `denial` inside the block — there
 		// is no inline TTL shorthand). Defaults to the surrounding server-block
@@ -462,6 +462,16 @@ func parse(c *caddy.Controller) (*Redis, error) {
 				}
 				re.resolver = net.JoinHostPort(host, port)
 
+			case "key_prefix":
+				args := c.RemainingArgs()
+				if len(args) != 1 {
+					return nil, c.ArgErr()
+				}
+				// args[0] == "" is a deliberate operator override: emit
+				// keys with no prefix at all. Otherwise we store the bare
+				// prefix; cacheKey() appends the ':' separator.
+				re.keyPrefix = strings.TrimSuffix(args[0], ":")
+
 			default:
 				return nil, c.ArgErr()
 			}
@@ -510,6 +520,12 @@ func parse(c *caddy.Controller) (*Redis, error) {
 		}
 		re.Zones = origins
 
+		// A server block may only declare one redis_cache directive; reject
+		// a second one explicitly instead of silently dropping it like a
+		// stock `for c.Next()` parser would.
+		if c.Next() {
+			return nil, c.Errf("only one redis_cache block per server")
+		}
 		return re, nil
 	}
 

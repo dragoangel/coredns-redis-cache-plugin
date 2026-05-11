@@ -39,9 +39,27 @@ func (re *Redis) clientOptions(addr string, dial dialFunc, tlsCfg *tls.Config) *
 	}
 }
 
+// applyClusterReadRouting sets ReadOnly / RouteByLatency / RouteRandomly on
+// a *redis.ClusterOptions based on the parsed `read_from` directive.
+// Notably the `primary` case is a deliberate no-op: ReadOnly stays false so
+// go-redis routes everything (incl. reads) to the slot's primary. Extracted
+// from connect() so the routing matrix can be unit-tested without spinning
+// up a cluster.
+func applyClusterReadRouting(opts *redis.ClusterOptions, readFrom string) {
+	switch readFrom {
+	case "random":
+		opts.ReadOnly = true
+		opts.RouteRandomly = true
+	case "primary":
+		// reads stay on primaries — ReadOnly intentionally left false
+	default: // "" or "latency"
+		opts.ReadOnly = true
+		opts.RouteByLatency = true
+	}
+}
+
 // clusterOptions builds the base *redis.ClusterOptions for cluster mode.
-// Caller layers ReadOnly / RouteByLatency / RouteRandomly on top based on
-// the `read_from` directive.
+// Caller layers read-routing via applyClusterReadRouting.
 func (re *Redis) clusterOptions(dial dialFunc, tlsCfg *tls.Config) *redis.ClusterOptions {
 	return &redis.ClusterOptions{
 		Addrs:           re.clusterAddrs,

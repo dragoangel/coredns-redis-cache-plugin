@@ -13,7 +13,11 @@ It is intended to sit *behind* the built-in *cache* plugin, which stays as the L
 cache; *redis_cache* is the L2 (networked) cache.
 
 If the Redis backend is unreachable the plugin becomes a noop and lookups continue to flow
-through the rest of the chain — DNS resolution is never blocked on the cache.
+through the rest of the chain. Writes never block the DNS reply (they run in a fire-and-forget
+goroutine on a detached context). Reads are bounded by the configured `timeout read` budget
+(default `500ms`) — the GET + TTL pipeline, pool wait and any retries all share that single
+budget — so a stalled Redis adds at most one `read` timeout to a single DNS reply before the
+plugin falls through.
 
 Each response is cached for the duration of its record TTL, clamped into a configurable range:
 `max(min, min(record_TTL, max))`. Defaults are `1h` max for positive responses and `30m` max
@@ -27,8 +31,11 @@ archived November 2025).
 
 ```txt
 redis_cache [ZONES...] {
+    success MAX_TTL [MIN_TTL]
+    denial MAX_TTL [MIN_TTL]
     endpoint ENDPOINT
     read_endpoint ENDPOINT [ENDPOINT...]
+    key_prefix STRING
     db NUMBER
     sentinel MASTER_NAME SENTINEL_ADDR [SENTINEL_ADDR...]
     cluster SEED_ADDR [SEED_ADDR...]
@@ -37,8 +44,6 @@ redis_cache [ZONES...] {
     password PASSWORD
     sentinel_username USERNAME
     sentinel_password PASSWORD
-    success MAX_TTL [MIN_TTL]
-    denial MAX_TTL [MIN_TTL]
     timeout {
         connect DURATION
         read DURATION
@@ -87,10 +92,21 @@ combinations rather than silently ignoring them:
   `sentinel_username` / `sentinel_password`.
 
 * **ZONES** (positional) — zones to cache for. Defaults to the surrounding server-block zones.
+* `success MAX_TTL [MIN_TTL]` — override TTL bounds for positive responses. MAX_TTL caps
+  the cache duration (default `1h`). MIN_TTL sets a floor (default `0`) — when the upstream
+  record TTL is shorter than this value, the cache duration is raised to this floor. Each
+  value accepts a Go duration (`30s`, `1h`) or a bare integer (seconds); sub-second values
+  like `500ms` are rejected.
+* `denial MAX_TTL [MIN_TTL]` — same as `success` but for negative responses (NXDOMAIN/NODATA).
+  Defaults: MAX_TTL `30m`, MIN_TTL `0`.
 * `endpoint` — write endpoint address (default `127.0.0.1:6379`). Accepts IPs or hostnames.
   If a port is omitted, 6379 is assumed.
 * `read_endpoint` — one or more read-only replica addresses. GETs route here, SETs go
   to `endpoint`. With ≥2 replicas, each GET picks one at random.
+* `key_prefix STRING` — namespace prefix for cache keys (default `cdrc`). Keys are stored
+  as `<key_prefix>:<hex>`; the `:` separator is appended automatically. Set to `""` to
+  disable the prefix entirely (bare hex keys on dedicated instance). A trailing `:` in the
+  configured value is trimmed so `key_prefix mycache` and `key_prefix mycache:` are equivalent.
 * `db NUMBER` — Redis logical database index for the data plane. Default `0`. Not allowed in
   `cluster` mode (Redis Cluster supports only DB 0).
 * `sentinel` — enable Sentinel mode. **Master Group Name is mandatory** and must be followed
@@ -108,13 +124,6 @@ combinations rather than silently ignoring them:
 * `password` — AUTH password for the data plane. Optional.
 * `sentinel_username` — ACL username for the Sentinel API. Optional; only used in `sentinel` mode.
 * `sentinel_password` — AUTH password for the Sentinel API. Optional; only used in `sentinel` mode.
-* `success MAX_TTL [MIN_TTL]` — override TTL bounds for positive responses. MAX_TTL caps
-  the cache duration (default `1h`). MIN_TTL sets a floor (default `0`) — when the upstream
-  record TTL is shorter than this value, the cache duration is raised to this floor. Each
-  value accepts a Go duration (`30s`, `1h`) or a bare integer (seconds); sub-second values
-  like `500ms` are rejected.
-* `denial MAX_TTL [MIN_TTL]` — same as `success` but for negative responses (NXDOMAIN/NODATA).
-  Defaults: MAX_TTL `30m`, MIN_TTL `0`.
 * `timeout` — Redis connection and operation timeouts:
     * `connect` — TCP dial timeout (default: `1s`).
     * `read` — per-command read timeout (default: `500ms`).
@@ -175,8 +184,9 @@ standard Redis convention:
 
 ## Known Compatibility
 
-The plugin speaks only standard RESP commands (`AUTH`, `GET`, `SET … EX`, `TTL`, `PING`,
-plus `CLUSTER SLOTS` in cluster mode and `SENTINEL get-master-addr-by-name` in Sentinel mode),
+The plugin speaks only standard RESP commands (`AUTH`, `GET`, `SET … EX`, `TTL`, `EXPIRE`,
+`PING`, plus `CLUSTER SLOTS` in cluster mode and `SENTINEL get-master-addr-by-name` in
+Sentinel mode),
 so it is expected to work with any reasonably complete Redis-protocol implementation. The
 tables below list what's been verified versus what's expected to work based on each engine's
 documented protocol coverage.

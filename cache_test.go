@@ -11,11 +11,12 @@ import (
 	"github.com/coredns/coredns/plugin/test"
 	"github.com/coredns/coredns/request"
 	"github.com/miekg/dns"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 )
 
 func TestCacheKey_Deterministic(t *testing.T) {
-	k1 := cacheKey("example.com.", dns.ClassINET, dns.TypeA, false)
-	k2 := cacheKey("example.com.", dns.ClassINET, dns.TypeA, false)
+	k1 := cacheKey("", "example.com.", dns.ClassINET, dns.TypeA, false)
+	k2 := cacheKey("", "example.com.", dns.ClassINET, dns.TypeA, false)
 	if k1 != k2 {
 		t.Fatalf("cacheKey not deterministic: %q vs %q", k1, k2)
 	}
@@ -23,50 +24,65 @@ func TestCacheKey_Deterministic(t *testing.T) {
 
 func TestCacheKey_Length(t *testing.T) {
 	// xxhash64 → 16 hex characters.
-	k := cacheKey("example.com.", dns.ClassINET, dns.TypeA, false)
+	k := cacheKey("", "example.com.", dns.ClassINET, dns.TypeA, false)
 	if len(k) != 16 {
 		t.Fatalf("expected 16-char hex key, got %d (%q)", len(k), k)
 	}
 }
 
 func TestCacheKey_CaseInsensitive(t *testing.T) {
-	lower := cacheKey("example.com.", dns.ClassINET, dns.TypeA, false)
-	upper := cacheKey("EXAMPLE.COM.", dns.ClassINET, dns.TypeA, false)
-	mixed := cacheKey("ExAmPlE.CoM.", dns.ClassINET, dns.TypeA, false)
+	lower := cacheKey("", "example.com.", dns.ClassINET, dns.TypeA, false)
+	upper := cacheKey("", "EXAMPLE.COM.", dns.ClassINET, dns.TypeA, false)
+	mixed := cacheKey("", "ExAmPlE.CoM.", dns.ClassINET, dns.TypeA, false)
 	if lower != upper || lower != mixed {
 		t.Fatalf("case-folding broken: lower=%s upper=%s mixed=%s", lower, upper, mixed)
 	}
 }
 
 func TestCacheKey_DistinguishesQClass(t *testing.T) {
-	in := cacheKey("version.bind.", dns.ClassINET, dns.TypeTXT, false)
-	ch := cacheKey("version.bind.", dns.ClassCHAOS, dns.TypeTXT, false)
+	in := cacheKey("", "version.bind.", dns.ClassINET, dns.TypeTXT, false)
+	ch := cacheKey("", "version.bind.", dns.ClassCHAOS, dns.TypeTXT, false)
 	if in == ch {
 		t.Fatalf("IN and CH must not share a key (%s)", in)
 	}
 }
 
 func TestCacheKey_DistinguishesQType(t *testing.T) {
-	a := cacheKey("example.com.", dns.ClassINET, dns.TypeA, false)
-	aaaa := cacheKey("example.com.", dns.ClassINET, dns.TypeAAAA, false)
+	a := cacheKey("", "example.com.", dns.ClassINET, dns.TypeA, false)
+	aaaa := cacheKey("", "example.com.", dns.ClassINET, dns.TypeAAAA, false)
 	if a == aaaa {
 		t.Fatalf("A and AAAA must not share a key")
 	}
 }
 
 func TestCacheKey_DistinguishesDO(t *testing.T) {
-	off := cacheKey("example.com.", dns.ClassINET, dns.TypeA, false)
-	on := cacheKey("example.com.", dns.ClassINET, dns.TypeA, true)
+	off := cacheKey("", "example.com.", dns.ClassINET, dns.TypeA, false)
+	on := cacheKey("", "example.com.", dns.ClassINET, dns.TypeA, true)
 	if off == on {
 		t.Fatalf("DO=0 and DO=1 must not share a key")
 	}
 }
 
 func TestCacheKey_DistinguishesQName(t *testing.T) {
-	a := cacheKey("a.example.com.", dns.ClassINET, dns.TypeA, false)
-	b := cacheKey("b.example.com.", dns.ClassINET, dns.TypeA, false)
+	a := cacheKey("", "a.example.com.", dns.ClassINET, dns.TypeA, false)
+	b := cacheKey("", "b.example.com.", dns.ClassINET, dns.TypeA, false)
 	if a == b {
 		t.Fatalf("different qnames must produce different keys")
+	}
+}
+
+func TestCacheKey_PrefixApplied(t *testing.T) {
+	bare := cacheKey("", "example.com.", dns.ClassINET, dns.TypeA, false)
+	pref := cacheKey("cdrc", "example.com.", dns.ClassINET, dns.TypeA, false)
+	if pref != "cdrc:"+bare {
+		t.Fatalf("expected %q, got %q", "cdrc:"+bare, pref)
+	}
+}
+
+func TestCacheKey_EmptyPrefixOmitsColon(t *testing.T) {
+	k := cacheKey("", "example.com.", dns.ClassINET, dns.TypeA, false)
+	if len(k) != 16 || k[:1] == ":" {
+		t.Fatalf("empty prefix must yield bare 16-hex with no separator, got %q", k)
 	}
 }
 
@@ -74,7 +90,7 @@ func TestCacheKey_LongName(t *testing.T) {
 	// A 250-byte qname is valid DNS; the implementation must not panic and
 	// must still produce the fixed 16-char hex output.
 	long := strings.Repeat("a", 248) + "."
-	k := cacheKey(long, dns.ClassINET, dns.TypeA, false)
+	k := cacheKey("", long, dns.ClassINET, dns.TypeA, false)
 	if len(k) != 16 {
 		t.Fatalf("long qname produced bad key len=%d", len(k))
 	}
@@ -90,7 +106,7 @@ func msg(qname string, qtype uint16) *dns.Msg {
 func TestKey_SkipsTruncated(t *testing.T) {
 	m := msg("example.com.", dns.TypeA)
 	m.Truncated = true
-	if got := key(m, response.NoError, false); got != "" {
+	if got := key("", m, response.NoError, false); got != "" {
 		t.Fatalf("truncated reply must not be cached, got key %q", got)
 	}
 }
@@ -98,7 +114,7 @@ func TestKey_SkipsTruncated(t *testing.T) {
 func TestKey_SkipsErrorMetaUpdate(t *testing.T) {
 	m := msg("example.com.", dns.TypeA)
 	for _, mt := range []response.Type{response.OtherError, response.Meta, response.Update} {
-		if got := key(m, mt, false); got != "" {
+		if got := key("", m, mt, false); got != "" {
 			t.Fatalf("response.Type %v must not be cached, got key %q", mt, got)
 		}
 	}
@@ -109,7 +125,7 @@ func TestKey_SkipsZeroQuestions(t *testing.T) {
 	// the protocol; refuse to cache rather than panic on m.Question[0].
 	m := new(dns.Msg)
 	m.Response = true
-	if got := key(m, response.NoError, false); got != "" {
+	if got := key("", m, response.NoError, false); got != "" {
 		t.Fatalf("0-question reply must not be cached, got key %q", got)
 	}
 }
@@ -124,7 +140,7 @@ func TestKey_SkipsMultipleQuestions(t *testing.T) {
 		Qtype:  dns.TypeAAAA,
 		Qclass: dns.ClassINET,
 	})
-	if got := key(m, response.NoError, false); got != "" {
+	if got := key("", m, response.NoError, false); got != "" {
 		t.Fatalf("multi-question reply must not be cached, got key %q", got)
 	}
 }
@@ -240,6 +256,56 @@ func TestWriteMsg_TTLClamp_NXDOMAINBelowDenialMin(t *testing.T) {
 	// SOA.Minttl = 5s, nMinTTL = 30s → raised to 30 (denial floor).
 	if got := rec.Msg.Ns[0].Header().Ttl; got != 30 {
 		t.Errorf("authority TTL: got %d, want 30 (raised to nMinTTL)", got)
+	}
+}
+
+func TestWriteMsg_EncodeErrorBumpsMetric(t *testing.T) {
+	// A malformed reply (TXT segment > 255 bytes is a hard RFC limit that
+	// miekg/dns rejects at Pack time) exercises the ToBytes-error branch
+	// and must increment cacheEncodeErrors; without this test the metric
+	// would be dead code.
+	w, _, cleanup := writeMsgFixture(t, "example.com.", dns.TypeTXT, time.Minute, 0, time.Minute, 0)
+	defer cleanup()
+
+	res := new(dns.Msg)
+	res.SetReply(w.state.Req)
+	res.Answer = []dns.RR{
+		&dns.TXT{
+			Hdr: dns.RR_Header{Name: "example.com.", Rrtype: dns.TypeTXT, Class: dns.ClassINET, Ttl: 60},
+			Txt: []string{strings.Repeat("x", 300)}, // > 255 → Pack fails
+		},
+	}
+
+	before := testutil.ToFloat64(cacheEncodeErrors.WithLabelValues(w.server))
+	if err := w.WriteMsg(res); err != nil {
+		t.Fatalf("WriteMsg: %v", err)
+	}
+	after := testutil.ToFloat64(cacheEncodeErrors.WithLabelValues(w.server))
+	if after-before != 1 {
+		t.Errorf("cacheEncodeErrors: got delta %v, want 1", after-before)
+	}
+}
+
+func TestWriteMsg_TTLClamp_DelegationUsesPositiveBounds(t *testing.T) {
+	// A referral / delegation reply (NoError + empty Answer + NS records in
+	// Authority) must be clamped by the SUCCESS bounds, using the NS TTL as
+	// msgTTL. Previously minMsgTTL silently returned 0 for response.Delegation,
+	// which collapsed duration to pMinTTL (or 0) regardless of upstream TTL.
+	w, rec, cleanup := writeMsgFixture(t, "delegated.example.", dns.TypeA, time.Hour, time.Minute, time.Minute, 0)
+	defer cleanup()
+
+	res := new(dns.Msg)
+	res.SetReply(w.state.Req)
+	ns1, _ := dns.NewRR("delegated.example. 1800 IN NS ns1.delegated.example.")
+	ns2, _ := dns.NewRR("delegated.example. 1800 IN NS ns2.delegated.example.")
+	res.Ns = []dns.RR{ns1, ns2}
+
+	if err := w.WriteMsg(res); err != nil {
+		t.Fatalf("WriteMsg: %v", err)
+	}
+	// NS TTL = 1800s, pMaxTTL = 3600, pMinTTL = 60 → clamp = 1800 (passthrough).
+	if got := rec.Msg.Ns[0].Header().Ttl; got != 1800 {
+		t.Errorf("delegation TTL: got %d, want 1800 (NS TTL passthrough within bounds)", got)
 	}
 }
 

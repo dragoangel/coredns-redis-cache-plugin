@@ -15,7 +15,7 @@ func ToBytes(m *dns.Msg) ([]byte, error) {
 // records. A wire-format error is returned to the caller so a corrupted Redis
 // value is treated as a read error rather than served as an empty (NODATA-
 // spoofing) reply.
-func FromBytes(b []byte, ttl int) (*dns.Msg, error) {
+func FromBytes(b []byte, ttl uint32) (*dns.Msg, error) {
 	m := new(dns.Msg)
 	if err := m.Unpack(b); err != nil {
 		return nil, err
