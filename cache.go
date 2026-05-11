@@ -139,23 +139,19 @@ func (w *ResponseWriter) WriteMsg(res *dns.Msg) error {
 	// Snapshot wire bytes before TTL clamping mutates `res` for the client,
 	// and before WriteMsg hands the message off. Cache reads recompute TTL
 	// from Redis PTTL, so the stored TTL value is throwaway anyway.
+	//
+	// At this point key() already rejected OtherError / Meta / Update / truncated
+	// / multi-question messages by returning "", so k != "" implies mt is one of
+	// NoError / Delegation / NameError / NoData — no need to switch on it again.
 	var wire []byte
 	if k != "" && duration > 0 {
-		switch {
-		case !w.state.Match(res):
+		if !w.state.Match(res) {
 			cacheResponseMismatches.WithLabelValues(w.server).Inc()
-		case mt == response.NoError || mt == response.Delegation || mt == response.NameError || mt == response.NoData:
-			b, err := ToBytes(res)
-			if err != nil {
-				log.Debugf("Failed to serialize DNS message for cache: %s", err)
-				cacheEncodeErrors.WithLabelValues(w.server).Inc()
-			} else {
-				wire = b
-			}
-		case mt == response.OtherError:
-			// don't cache
-		default:
-			log.Warningf("Redis called with unknown typification: %d", mt)
+		} else if b, err := ToBytes(res); err != nil {
+			log.Debugf("Failed to serialize DNS message for cache: %s", err)
+			cacheEncodeErrors.WithLabelValues(w.server).Inc()
+		} else {
+			wire = b
 		}
 	}
 

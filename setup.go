@@ -82,14 +82,16 @@ func parse(c *caddy.Controller) (*Redis, error) {
 	re := New()
 
 	for c.Next() {
-		origins := make([]string, len(c.ServerBlockKeys))
-		copy(origins, c.ServerBlockKeys)
-		args := c.RemainingArgs()
-
-		if len(args) > 0 {
-			// All positional args are zones. TTL is configured via `success` / `denial`
-			// inside the block — there is no inline TTL shorthand.
-			copy(origins, args)
+		// Positional args, if provided, fully replace the server-block zones
+		// (TTL is configured via `success` / `denial` inside the block — there
+		// is no inline TTL shorthand). Defaults to the surrounding server-block
+		// zones when no positional arg is given. Copy in both cases so the
+		// later in-place NormalizeExact() doesn't mutate Caddy's slice.
+		var origins []string
+		if args := c.RemainingArgs(); len(args) > 0 {
+			origins = append([]string(nil), args...)
+		} else {
+			origins = append([]string(nil), c.ServerBlockKeys...)
 		}
 
 		for c.NextBlock() {
