@@ -26,8 +26,8 @@ var (
 		Namespace: plugin.Namespace,
 		Subsystem: "redis_cache",
 		Name:      "get_errors_total",
-		Help:      "The count of errors when reading entries from Redis.",
-	}, []string{"server"})
+		Help:      "The count of errors when reading entries from Redis, bucketed by reason (timeout, connection, other).",
+	}, []string{"server", "reason"})
 
 	cacheResponseMismatches = promauto.NewCounterVec(prometheus.CounterOpts{
 		Namespace: plugin.Namespace,
@@ -40,8 +40,8 @@ var (
 		Namespace: plugin.Namespace,
 		Subsystem: "redis_cache",
 		Name:      "set_errors_total",
-		Help:      "The count of errors when adding entries to Redis.",
-	}, []string{"server"})
+		Help:      "The count of errors when adding entries to Redis, bucketed by reason (timeout, connection, other).",
+	}, []string{"server", "reason"})
 
 	cacheCollisions = promauto.NewCounterVec(prometheus.CounterOpts{
 		Namespace: plugin.Namespace,

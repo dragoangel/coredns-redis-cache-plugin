@@ -2,7 +2,9 @@ package redis_cache
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	"net"
 	"time"
 
@@ -327,8 +329,10 @@ func (re *Redis) Get(ctx context.Context, key string) (*dns.Msg, error) {
 		return nil, err
 	}
 	if len(b) == 0 {
-		// Should not happen ever, but if faced, evict so we don't keep
-		// handling the same empty value as a miss until natural TTL.
+		// Distinct from redis.Nil: the key exists but holds an empty string
+		// (RESP returns a valid zero-length bulk). Shouldn't happen for our
+		// own writes, but if something put an empty value under our key,
+		// evict so we don't keep handling it as a miss until natural TTL.
 		re.evictAsync(ctx, key)
 		return nil, nil
 	}
@@ -376,18 +380,19 @@ func (re *Redis) evictAsync(parent context.Context, key string) {
 	}()
 }
 
-// get looks up a cached response for the given request. After fetching, the
-// cached message's question is verified to match the request as defense in
-// depth against corrupted entries or version-skewed encodings; a mismatch is
-// reported via cacheCollisions and treated as a miss.
+// get looks up a cached response for the given request. After fetching, every
+// component that goes into the cache key (qname, qtype, qclass, DO, CD) is
+// re-verified against the cached message as a cheap backstop for the
+// (vanishingly rare) case of a 64-bit hash collision; a mismatch is reported
+// via cacheCollisions and treated as a miss.
 func (re *Redis) get(ctx context.Context, state request.Request, server string) *dns.Msg {
-	k := cacheKey(re.keyPrefix, state.Name(), state.QClass(), state.QType(), state.Do())
+	k := cacheKey(re.keyPrefix, state.Name(), state.QClass(), state.QType(), state.Do(), state.Req.CheckingDisabled)
 
 	m, err := re.Get(ctx, k)
 	if err != nil {
 		// Counter increments unconditionally; the log line is throttled to
 		// avoid drowning log pipelines during a Redis outage.
-		cacheReadErrors.WithLabelValues(server).Inc()
+		cacheReadErrors.WithLabelValues(server, errReason(err)).Inc()
 		re.readErrLog.Do(func() {
 			log.Warningf("Redis cache read error for %s: %s", state.Name(), err)
 		})
@@ -397,9 +402,14 @@ func (re *Redis) get(ctx context.Context, state request.Request, server string) 
 		cacheMisses.WithLabelValues(server).Inc()
 		return nil
 	}
-	if !state.Match(m) || m.Question[0].Qclass != state.QClass() {
-		log.Warningf("Redis cache returned mismatched question for %s (got %q type=%d class=%d)",
-			state.Name(), m.Question[0].Name, m.Question[0].Qtype, m.Question[0].Qclass)
+	cachedDO := false
+	if opt := m.IsEdns0(); opt != nil {
+		cachedDO = opt.Do()
+	}
+	if !state.Match(m) || m.Question[0].Qclass != state.QClass() || cachedDO != state.Do() || m.CheckingDisabled != state.Req.CheckingDisabled {
+		log.Warningf("Redis cache returned mismatched question (got name=%q type=%d class=%d do=%t cd=%t, want name=%q type=%d class=%d do=%t cd=%t)",
+			m.Question[0].Name, m.Question[0].Qtype, m.Question[0].Qclass, cachedDO, m.CheckingDisabled,
+			state.Name(), state.QType(), state.QClass(), state.Do(), state.Req.CheckingDisabled)
 		cacheCollisions.WithLabelValues(server).Inc()
 		// Self-heal: mark the poisoned key as expired so the next request for it
 		// gets a clean miss instead of re-tripping the same mismatch until natural TTL.
@@ -409,4 +419,50 @@ func (re *Redis) get(ctx context.Context, state request.Request, server string) 
 	log.Debugf("Returning response from Redis cache: %s for %s", m.Question[0].Name, state.Name())
 	cacheHits.WithLabelValues(server).Inc()
 	return m
+}
+
+// errReason categorises a Redis client error for the reason= label on
+// cache_{get,set}_errors_total. The three buckets are operationally distinct:
+//
+//   - "timeout"    — context deadline / cancellation, net.Error with
+//     Timeout()==true, or redis.ErrPoolTimeout (pool wait
+//     exceeded). Look at Redis latency, CPU, pool sizing.
+//   - "connection" — non-timeout net errors and raw end-of-stream:
+//     dial refused, reset, io.EOF / io.ErrUnexpectedEOF from
+//     a half-closed peer. Look at connectivity, DNS, firewall,
+//     Redis liveness.
+//   - "other"      — RESP-level (NOAUTH, WRONGPASS, WRONGTYPE, parse errors,
+//     unhandled MOVED, etc.) or anything not net-related.
+//     Typically a config or code issue rather than a transient
+//     outage.
+//
+// io.EOF is checked explicitly because go-redis's RESP reader surfaces a
+// server-side connection close as a raw io.EOF (not wrapped in *net.OpError),
+// which would otherwise fall through to "other" and hide a real connectivity
+// incident behind the application-error bucket. TestErrReason_RealClientErrors
+// pins each bucket against the live go-redis client so a future upgrade that
+// reshapes errors fails loudly here rather than silently mis-bucketing.
+//
+// Callers must not pass redis.Nil here — that is a cache miss, not an error,
+// and is filtered out earlier on the read path.
+func errReason(err error) string {
+	if err == nil {
+		return ""
+	}
+	if errors.Is(err, context.DeadlineExceeded) ||
+		errors.Is(err, context.Canceled) ||
+		errors.Is(err, redis.ErrPoolTimeout) {
+		return "timeout"
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) {
+		if netErr.Timeout() {
+			return "timeout"
+		}
+		return "connection"
+	}
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+		return "connection"
+	}
+	return "other"
 }

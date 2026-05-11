@@ -32,11 +32,20 @@ func key(prefix string, m *dns.Msg, t response.Type, do bool) string {
 	if t == response.OtherError || t == response.Meta || t == response.Update {
 		return ""
 	}
-	return cacheKey(prefix, m.Question[0].Name, m.Question[0].Qclass, m.Question[0].Qtype, do)
+	return cacheKey(prefix, m.Question[0].Name, m.Question[0].Qclass, m.Question[0].Qtype, do, m.CheckingDisabled)
 }
 
 // cacheKey returns the Redis key for a DNS question, mixing qclass, qtype,
-// the DO flag, and the lowercased qname.
+// the DO flag, the CD flag, and the lowercased qname.
+//
+// CD (Checking Disabled, RFC 4035 §3.2.2) is in the key, not just verified
+// after fetch, because mixing CD=0 and CD=1 entries under one key is a real
+// poisoning vector against DNSSEC: a validating upstream returns SERVFAIL for
+// a bogus name when CD=0, but returns the unvalidated record when CD=1. If
+// both shared a cache slot, a CD=1 query (any attacker) would overwrite the
+// SERVFAIL entry with the bogus record and CD=0 clients — who trust DNSSEC —
+// would receive forged data without SERVFAIL. Splitting by CD removes the
+// shared slot; the post-fetch verify in re.get is the belt over the braces.
 //
 // Hash choice (compared at ~1M cached entries, the L2's stated sweet spot):
 //
@@ -46,17 +55,20 @@ func key(prefix string, m *dns.Msg, t response.Type, do bool) string {
 //	xxhash128   32 hex / 16 B   ~3e-27 (effectively zero)
 //
 // xxhash64 is chosen: collisions are statistically irrelevant at any plausible
-// fleet scale, and the post-fetch question check in re.get catches residual
-// collisions, corruption, or version-skew, accounting them via cacheCollisions
-// — so a 128-bit hash buys nothing operationally and FNV-32 is dangerous (the
-// 32-bit space is birthday-bound past ~77 K entries, exploitable as a cross-
-// domain substitution oracle on a shared L2).
-func cacheKey(prefix, qname string, qclass, qtype uint16, do bool) string {
-	var hdr [5]byte
+// fleet scale, and the post-fetch verify in re.get is a cheap backstop that
+// turns the rare statistical collision into a counted miss rather than a
+// wrong answer — so a 128-bit hash buys nothing operationally and FNV-32 is
+// dangerous (the 32-bit space is birthday-bound past ~77 K entries,
+// exploitable as a cross-domain substitution oracle on a shared L2).
+func cacheKey(prefix, qname string, qclass, qtype uint16, do, cd bool) string {
+	var hdr [6]byte
 	binary.BigEndian.PutUint16(hdr[0:2], qclass)
 	binary.BigEndian.PutUint16(hdr[2:4], qtype)
 	if do {
 		hdr[4] = 1
+	}
+	if cd {
+		hdr[5] = 1
 	}
 
 	h := xxhash.New()
@@ -184,7 +196,7 @@ func (w *ResponseWriter) WriteMsg(res *dns.Msg) error {
 			_, _, _ = w.writeFlight.Do(k, func() (interface{}, error) {
 				if addErr := w.Add(context.WithoutCancel(w.ctx), k, wire, duration); addErr != nil {
 					log.Debugf("Failed to add response to Redis cache: %s", addErr)
-					cacheSetErrors.WithLabelValues(w.server).Inc()
+					cacheSetErrors.WithLabelValues(w.server, errReason(addErr)).Inc()
 				}
 				return nil, nil
 			})

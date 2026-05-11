@@ -182,6 +182,23 @@ standard Redis convention:
 * username + password → full ACL auth (Redis 6+ for the data plane, Sentinel 6.2+ for the
   Sentinel API).
 
+#### Cache key isolation
+
+The cache key is `xxhash64(qclass || qtype || DO || CD || lowercase(qname))`, namespaced
+by `key_prefix`. All five components are mixed into the hash *and* re-verified after each
+GET — a mismatch is treated as a miss, self-healed via async eviction, and reported via
+`coredns_redis_cache_collisions_total`.
+
+Practical guarantees this gives operators running mixed-client traffic:
+
+* IN and CHAOS lookups (e.g. `version.bind.`) never share a slot with normal Internet
+  queries for the same qname.
+* DNSSEC-aware (`DO=1`) and non-DNSSEC clients keep separate entries — neither receives
+  the other's response with extra or missing `RRSIG` / `NSEC` records.
+* DNSSEC-validating (`CD=0`) and validation-bypassing (`CD=1`) queries are isolated. A
+  CD=1 query for a DNSSEC-bogus name cannot poison the cache against a CD=0 client that
+  would have received SERVFAIL from a validating upstream.
+
 ## Known Compatibility
 
 The plugin speaks only standard RESP commands (`AUTH`, `GET`, `SET … EX`, `TTL`, `EXPIRE`,
@@ -322,11 +339,25 @@ If monitoring is enabled (via the *prometheus* directive) then the following met
 
 * `coredns_redis_cache_hits_total{server}` — The count of cache hits from Redis.
 * `coredns_redis_cache_misses_total{server}` — The count of cache misses from Redis.
-* `coredns_redis_cache_get_errors_total{server}` — The count of errors when reading entries from Redis.
-* `coredns_redis_cache_set_errors_total{server}` — The count of errors when adding entries to Redis.
+* `coredns_redis_cache_get_errors_total{server,reason}` — The count of errors when reading entries from Redis. See *Error reasons* below for the `reason` buckets.
+* `coredns_redis_cache_set_errors_total{server,reason}` — The count of errors when adding entries to Redis. Same `reason` buckets as `get_errors_total`.
 * `coredns_redis_cache_encode_errors_total{server}` — The count of DNS messages that could not be serialized to wire format and so were not cached.
 * `coredns_redis_cache_response_mismatches_total{server}` — The count of upstream replies whose question did not match the original request and were therefore refused for caching (the reply itself is still passed to the client). Non-zero suggests a misbehaving forwarder upstream or an attempted cache-poisoning probe.
-* `coredns_redis_cache_collisions_total{server}` — The count of cache hits whose stored question did not match the request (treated as a miss; non-zero indicates corruption, version skew, or — extremely unlikely — a 64-bit key hash collision).
+* `coredns_redis_cache_collisions_total{server}` — The count of cache hits whose stored entry did not match the request (qname/qtype/qclass/DO/CD all re-verified after GET; mismatched entries are treated as a miss and asynchronously evicted).
+
+#### Error reasons
+
+`get_errors_total` and `set_errors_total` are bucketed by `reason`:
+
+* `timeout` — context deadline / cancellation, a network timeout, or a connection-pool wait
+  timeout. Look at Redis latency / CPU, pool sizing, and the configured `timeout read` /
+  `pool wait_timeout` budgets.
+* `connection` — non-timeout network failures: dial refused, connection reset, EOF mid-op.
+  Look at connectivity (DNS, firewall, route), and whether Redis is up and accepting
+  connections.
+* `other` — RESP-level errors (`NOAUTH`, `WRONGPASS`, parse failures, unhandled `MOVED`,
+  etc.) or anything that isn't a network error. Typically a configuration or code issue
+  rather than a transient outage.
 
 ## Examples
 
