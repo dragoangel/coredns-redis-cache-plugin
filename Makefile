@@ -2,6 +2,8 @@ GO ?= go
 GOBIN ?= $(shell $(GO) env GOPATH)/bin
 GOLANGCI_LINT ?= $(GOBIN)/golangci-lint
 GOLANGCI_LINT_VERSION ?= v2.12.2
+GOVULNCHECK ?= $(GOBIN)/govulncheck
+GOVULNCHECK_VERSION ?= v1.1.4
 
 .PHONY: help
 help: ## Show available targets.
@@ -58,12 +60,21 @@ cover: ## Run tests with a coverage report.
 cover-html: cover ## Open the HTML coverage report.
 	$(GO) tool cover -html=coverage.out
 
+.PHONY: vuln
+vuln: ## Scan dependencies for known vulnerabilities (install with `make tools`).
+	@if [ ! -x "$(GOVULNCHECK)" ] && ! command -v govulncheck >/dev/null 2>&1; then \
+		echo "govulncheck not found. Run 'make tools' to install $(GOVULNCHECK_VERSION)." >&2; \
+		exit 1; \
+	fi
+	@if [ -x "$(GOVULNCHECK)" ]; then $(GOVULNCHECK) ./...; else govulncheck ./...; fi
+
 .PHONY: ci
-ci: fmt-check tidy-check vet lint test-race ## Run the full CI pipeline locally.
+ci: fmt-check tidy-check vet lint test-race vuln ## Run the full CI pipeline locally.
 
 .PHONY: tools
-tools: ## Install required dev tools (golangci-lint $(GOLANGCI_LINT_VERSION)).
+tools: ## Install required dev tools (golangci-lint, govulncheck).
 	$(GO) install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@$(GOLANGCI_LINT_VERSION)
+	$(GO) install golang.org/x/vuln/cmd/govulncheck@$(GOVULNCHECK_VERSION)
 
 .PHONY: hooks
 hooks: ## Install pre-commit hooks (requires the `pre-commit` Python tool).
@@ -93,14 +104,14 @@ release: ## Tag a release. Usage: make release VERSION=vX.Y.Z
 		v[0-9]*.[0-9]*.[0-9]*) ;; \
 		*) echo "VERSION must be vMAJOR.MINOR.PATCH (e.g. v0.1.0)" >&2; exit 1 ;; \
 	esac
-	@if [ -n "$$(git status --porcelain)" ]; then \
-		echo "Working tree is dirty. Commit or stash first." >&2; exit 1; \
+	@if [ -z "$(ALLOW_DIRTY)" ] && [ -n "$$(git status --porcelain)" ]; then \
+		echo "Working tree is dirty. Commit or stash first, or set ALLOW_DIRTY=1 to override." >&2; exit 1; \
 	fi
 	@if git rev-parse "$(VERSION)" >/dev/null 2>&1; then \
 		echo "Tag $(VERSION) already exists." >&2; exit 1; \
 	fi
 	$(MAKE) ci
-	git tag -a "$(VERSION)" -m "Release $(VERSION)"
+	@GPG_TTY=$$(tty) git tag -a "$(VERSION)" -m "Release $(VERSION)"
 	@echo
 	@echo "Tagged $(VERSION) locally. To publish:"
 	@echo "    git push origin $(VERSION)"

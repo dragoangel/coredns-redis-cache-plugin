@@ -36,7 +36,7 @@ var (
 		Help:      "The count of upstream replies whose question did not match the original request and were therefore refused for caching. Non-zero suggests a misbehaving forwarder upstream or an attempted cache-poisoning probe.",
 	}, []string{"server"})
 
-	redisErr = promauto.NewCounterVec(prometheus.CounterOpts{
+	cacheSetErrors = promauto.NewCounterVec(prometheus.CounterOpts{
 		Namespace: plugin.Namespace,
 		Subsystem: "redis_cache",
 		Name:      "set_errors_total",

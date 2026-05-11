@@ -141,6 +141,16 @@ func TestSetup(t *testing.T) {
 			denial 1800 -10
 		}`, true, 0, 0, 0, 0, "", "", "", 0, 0, 0, ""},
 
+		// Error: success min > max (would invert clamp)
+		{`redis_cache {
+			success 30s 1h
+		}`, true, 0, 0, 0, 0, "", "", "", 0, 0, 0, ""},
+
+		// Error: denial min > max (would invert clamp)
+		{`redis_cache {
+			denial 10s 5m
+		}`, true, 0, 0, 0, 0, "", "", "", 0, 0, 0, ""},
+
 		// min of 0 is valid (means no floor)
 		{`redis_cache {
 			success 3600 0
@@ -706,13 +716,22 @@ func TestSetupPoolAndNetwork(t *testing.T) {
 			maxRetryBackoff: 1024 * time.Millisecond,
 		},
 		{
-			name: "retries max -1 disables retries",
+			name: "retries max 0 disables retries",
+			input: `redis_cache {
+				retries {
+					max 0
+				}
+			}`,
+			maxRetries: -1, // parser translates user 0 to go-redis -1 (disabled)
+		},
+		{
+			name: "retries max negative is rejected",
 			input: `redis_cache {
 				retries {
 					max -1
 				}
 			}`,
-			maxRetries: -1,
+			shouldErr: true,
 		},
 		{
 			name: "tcp_keepalive top-level (Go duration string)",
@@ -869,8 +888,12 @@ func TestSetupPoolAndNetwork(t *testing.T) {
 			if re.connMaxLifetime != tc.connMaxLifetime {
 				t.Errorf("connMaxLifetime: got %v, want %v", re.connMaxLifetime, tc.connMaxLifetime)
 			}
-			if re.poolTimeout != tc.poolTimeout {
-				t.Errorf("poolTimeout: got %v, want %v", re.poolTimeout, tc.poolTimeout)
+			expectedPoolTimeout := tc.poolTimeout
+			if expectedPoolTimeout == 0 {
+				expectedPoolTimeout = defaultPoolTimeout
+			}
+			if re.poolTimeout != expectedPoolTimeout {
+				t.Errorf("poolTimeout: got %v, want %v", re.poolTimeout, expectedPoolTimeout)
 			}
 			if re.maxRetries != tc.maxRetries {
 				t.Errorf("maxRetries: got %d, want %d", re.maxRetries, tc.maxRetries)

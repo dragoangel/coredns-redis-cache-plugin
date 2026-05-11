@@ -81,21 +81,22 @@ combinations rather than silently ignoring them:
   come from `cluster`; the rest of the topology is discovered via `CLUSTER SLOTS`.
 * `sentinel` mode (the `sentinel` directive is set) rejects `endpoint` and `read_endpoint` —
   the master and replicas are discovered via Sentinel.
-* Default mode (neither `cluster` nor `sentinel`): writes go to `endpoint`. If no
-  `read_endpoint` is given, the same client handles reads (standalone). If one or more
-  `read_endpoint` entries are listed, reads are routed across those replicas instead.
-  Rejects `read_from` and `sentinel_username` / `sentinel_password`.
+* Default mode (neither `cluster` nor `sentinel`): writes go to `endpoint`. With no
+  `read_endpoint`, the same client serves reads. With one, that client serves reads.
+  With ≥2, each GET picks a replica at random. Rejects `read_from` and
+  `sentinel_username` / `sentinel_password`.
 
 * **ZONES** (positional) — zones to cache for. Defaults to the surrounding server-block zones.
 * `endpoint` — write endpoint address (default `127.0.0.1:6379`). Accepts IPs or hostnames.
   If a port is omitted, 6379 is assumed.
-* `read_endpoint` — one or more read-only replica addresses. When specified, GET operations are
-  routed to these replicas while SET operations go to `endpoint`.
+* `read_endpoint` — one or more read-only replica addresses. GETs route here, SETs go
+  to `endpoint`. With ≥2 replicas, each GET picks one at random.
 * `db NUMBER` — Redis logical database index for the data plane. Default `0`. Not allowed in
   `cluster` mode (Redis Cluster supports only DB 0).
 * `sentinel` — enable Sentinel mode. **Master Group Name is mandatory** and must be followed
-  by one or more sentinel addresses. When configured, the plugin discovers the current master
-  and replicas automatically. Writes route to the master; reads route to replicas.
+  by one or more sentinel addresses. The plugin discovers the current master and replicas
+  via Sentinel (single quorum subscription); writes go to the master, reads pick a replica
+  at random per GET.
 * `cluster` — enable Cluster mode. Takes one or more seed node addresses; the smart client
   discovers the full topology via `CLUSTER SLOTS`. Mutually exclusive with `sentinel` and
   `read_endpoint`. The `endpoint` directive is ignored in cluster mode.
@@ -116,12 +117,9 @@ combinations rather than silently ignoring them:
   Defaults: MAX_TTL `30m`, MIN_TTL `0`.
 * `timeout` — Redis connection and operation timeouts:
     * `connect` — TCP dial timeout (default: `1s`).
-    * `read` — per-command read timeout (default: `1s`).
+    * `read` — per-command read timeout (default: `500ms`).
     * `write` — per-command write timeout (default: `2s`).
-* `pool` — connection-pool tuning. Each setting maps directly to the corresponding go-redis
-  field; any value left unset (i.e. directive omitted) falls through to go-redis's documented
-  default — values noted below in parentheses are those upstream defaults, *not* hardcoded
-  here. All values are non-negative integers.
+* `pool` — connection-pool tuning. Values are non-negative integers.
     * `size N` — maximum sockets per client (default `10 × runtime.GOMAXPROCS()`).
     * `min_idle N` — minimum idle sockets to keep warm (default `0`).
     * `max_idle N` — maximum idle sockets (default `0` = unlimited).
@@ -131,21 +129,15 @@ combinations rather than silently ignoring them:
       (default `30m`). Set to less than your load balancer / NAT idle drop window.
     * `max_lifetime DURATION` — force-recycle any connection older than this regardless
       of activity (default `0` = no limit).
-    * `wait_timeout DURATION` — how long a query waits for a free connection when the
-      pool is saturated before erroring (default: go-redis uses `read_timeout + 1s`).
+    * `wait_timeout DURATION` — how long a query waits for a free pool connection
+      before erroring (default `500ms`).
 * `retries` — retry behavior for transient network errors:
-    * `max N` — number of retries per operation. **Plugin default is `1`** (one retry on
-      transient errors; absorbs an isolated dropped packet without amplifying a sustained
-      outage into multi-second DNS waits). Set `-1` to disable retries entirely; `0` falls
-      back to go-redis's default of `3` (rarely what you want for an L2 DNS cache);
-      positive values are taken literally.
+    * `max N` — number of retries per operation (default `1`), `0` disables retries.
     * `min_backoff DURATION` — initial backoff between retries (default `8ms` — go-redis).
     * `max_backoff DURATION` — cap on backoff between retries (default `512ms` — go-redis).
     Constraint: `min_backoff` must not exceed `max_backoff` when both are set.
-* `tcp_keepalive DURATION` — interval for TCP keepalive probes on Redis connections.
-  Default uses Go's built-in keepalive interval. Set to a value smaller than your firewall
-  / NAT / service-mesh idle-drop window (often `60s`–`5m`) to keep long-lived idle
-  connections from being silently killed.
+* `tcp_keepalive DURATION` — TCP keepalive probe interval (default Go's built-in).
+  Set below your NAT / firewall / mesh idle-drop window to prevent silent kills.
 * `tls` — enable TLS. **No args.** Verifies the server cert against the OS trust store.
   Use `tls_ca` to override the trust store, `tls_cert`/`tls_key` for mTLS. Implicitly
   enabled by any other `tls_*` directive — bare `tls` is only needed when no other TLS
@@ -159,11 +151,11 @@ combinations rather than silently ignoring them:
   Default `on`. Set to `off` to disable all server-cert verification (chain *and* hostname);
   use only for development or fully-trusted networks. Accepts `on`/`off`, `true`/`false`,
   `yes`/`no`, `1`/`0`.
-* `tls_verify_hostname BOOL` — verify the server cert's SAN/CN matches the hostname dialed.
-  Default `on`. Set to `off` when one configuration connects to multiple peers (cluster
-  seeds, sentinel quorum, replication followers) whose certs share a CA but each carry
-  their own hostname — chain verification still runs, only the per-host SAN/CN check is
-  skipped. Has no effect when `tls_verify_chain` is `off` (chain-off implies hostname-off).
+* `tls_verify_hostname BOOL` — verify the server cert's SAN/CN matches the dialed
+  hostname. Default `on`. Workaround for topologies where the dialed name cannot match
+  the cert SAN (per-pod certs, Cluster MOVED redirects, Sentinel master/replica
+  discovery, VIP fronting); chain verification still runs. Properly-issued certs should
+  not require this. Has no effect when `tls_verify_chain` is `off`. See the example below.
 * `resolver ADDRESS` — DNS server to use for resolving Redis endpoint hostnames instead of the
   system resolver. Useful in deployments where CoreDNS itself intercepts the system resolver
   (e.g. node-local-dns) and resolving the Redis service name through it would create a circular
@@ -251,13 +243,13 @@ The resulting `coredns` binary now recognizes the `redis_cache` directive in you
 
 ### First-time setup
 
-You need the Go toolchain (version per `go.mod`), `golangci-lint`, and the
-[`pre-commit`](https://pre-commit.com) Python tool.
+You need the Go toolchain (version per `go.mod`), `golangci-lint`, `govulncheck`,
+and the [`pre-commit`](https://pre-commit.com) Python tool.
 
 **Linux/macOS:**
 
 ```sh
-make tools                  # installs golangci-lint at the pinned version
+make tools                  # installs golangci-lint and govulncheck at pinned versions
 pip install --user pre-commit
 make hooks                  # runs `pre-commit install`
 ```
@@ -269,6 +261,9 @@ winget install GoLang.Go
 winget install GolangCI.golangci-lint
 winget install Python.Python.3
 
+:: govulncheck has no winget package; install via go:
+go install golang.org/x/vuln/cmd/govulncheck@latest
+
 :: pre-commit has no first-party winget package; install via pip:
 pip install --user pre-commit
 
@@ -276,10 +271,9 @@ pip install --user pre-commit
 pre-commit install
 ```
 
-After installing tools via winget, **close and reopen the terminal** so the
-updated `PATH` is picked up. If `pre-commit` is still not found, add
-`%APPDATA%\Python\Python3XX\Scripts` (replace `3XX` with your installed
-version, see `where python`) to your user `PATH`.
+After winget installs, restart the terminal so the updated `PATH` is picked up;
+if `pre-commit` is still not found, add `%APPDATA%\Python\Python3XX\Scripts`
+to user `PATH`.
 
 From this point every `git commit` runs `gofmt`/`goimports`, `go vet`,
 `go mod tidy`, the test suite, and `golangci-lint`. The hooks invoke `go`
@@ -296,7 +290,8 @@ make test          # go test ./...
 make test-race     # go test -race ./...
 make lint          # golangci-lint run
 make fmt           # gofmt -s -w .
-make ci            # full pipeline: fmt-check + tidy-check + vet + lint + test-race
+make vuln          # govulncheck ./...
+make ci            # full pipeline: fmt-check + tidy-check + vet + lint + test-race + vuln
 ```
 
 Windows users can call the underlying commands directly (`go test ./...`,
@@ -349,7 +344,7 @@ in the directive list.
 
 ### Explicit read replicas
 
-Writes to a known master, reads round-robin across replicas:
+Writes to a known master, reads random-balanced across replicas:
 
 ```corefile
 redis_cache {
@@ -431,19 +426,28 @@ redis_cache {
 }
 ```
 
-### TLS — multi-host with shared CA
+### TLS — Kubernetes Redis Cluster with per-pod certs
 
-Cluster / sentinel / multi-replica setups where peers share a CA but each carries its own
-hostname and cert SAN not align — keep chain verification, but skip per-host SAN/CN check:
+Workaround for setups where issuing certs whose SAN matches the dialed name is not
+practical: a StatefulSet-deployed Redis/Valkey cluster typically presents per-pod
+certs (SAN = `<pod>.<headless-svc>.<ns>.svc.cluster.local`), the client dials a
+service name, and Cluster MOVED redirects further route to peers whose SANs won't
+match anything pre-declared. Chain verification still applies to every peer:
 
 ```corefile
 redis_cache {
-    cluster valkey-0:6379 valkey-1:6379 valkey-2:6379
-    tls_ca /etc/redis/tls/ca.pem
+    cluster redis-cluster-0.redis-cluster-headless.cache.svc.cluster.local:6379 \
+            redis-cluster-1.redis-cluster-headless.cache.svc.cluster.local:6379 \
+            redis-cluster-2.redis-cluster-headless.cache.svc.cluster.local:6379
+    tls_ca              /etc/redis/tls/ca.pem
     tls_verify_hostname off
-    password s3cret
+    password            s3cret
 }
 ```
+
+Same workaround applies to Sentinel-discovered masters/replicas and HA-proxy/VIP
+fronting a fleet of per-pod certs. Prefer issuing certs whose SAN covers the dialed
+name where you control the PKI.
 
 ### Kubernetes node-local-dns
 

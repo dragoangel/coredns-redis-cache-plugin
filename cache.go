@@ -18,6 +18,14 @@ import (
 // key returns the cache key for a DNS message. Returns "" if the message should not be cached.
 // We do not cache truncated responses, errors, meta, or update messages.
 func key(m *dns.Msg, t response.Type, do bool) string {
+	// Defense in depth: standard DNS carries exactly one question (QDCOUNT
+	// can technically be 0 or 2+ per the wire format, but the protocol
+	// never defined semantics for those). Refuse to cache anything else,
+	// matching state.Match's len==1 invariant on the read path so we don't
+	// produce entries that could never legitimately be served.
+	if len(m.Question) != 1 {
+		return ""
+	}
 	if m.Truncated {
 		return ""
 	}
@@ -81,13 +89,30 @@ type ResponseWriter struct {
 	state request.Request
 	*Redis
 	server string
-	ctx    context.Context
+	// ctx breaks Go's "don't store contexts in structs" idiom on purpose:
+	// dns.ResponseWriter.WriteMsg has no ctx parameter, but we need one for
+	// the async Redis SET fired from WriteMsg. ServeDNS stashes the request
+	// ctx here on the way in; WriteMsg derives a detached child for the SET.
+	ctx context.Context
 }
 
 // WriteMsg implements the dns.ResponseWriter interface.
+//
+// The Redis SET runs in a fire-and-forget goroutine with a context detached
+// from the request, so:
+//
+//   - the DNS reply to the client is never blocked on Redis latency, even when
+//     Redis stalls up to writeTimeout × (maxRetries+1);
+//   - a cache entry still lands when the upstream client cancels mid-flight,
+//     so the next requester gets a hit instead of re-burdening upstream.
+//
+// Wire bytes are packed synchronously: encoding failures are observed at the
+// right time, and the goroutine never reads a *dns.Msg the caller may still
+// mutate after WriteMsg returns. go-redis's own writeTimeout / MaxRetries
+// bound how long the goroutine can run; no extra cap is layered on top.
 func (w *ResponseWriter) WriteMsg(res *dns.Msg) error {
 	do := false
-	mt, opt := response.Typify(res, w.now().UTC())
+	mt, opt := response.Typify(res, time.Now().UTC())
 	if opt != nil {
 		do = opt.Do()
 	}
@@ -111,56 +136,45 @@ func (w *ResponseWriter) WriteMsg(res *dns.Msg) error {
 		duration = minDur
 	}
 
+	// Snapshot wire bytes before TTL clamping mutates `res` for the client,
+	// and before WriteMsg hands the message off. Cache reads recompute TTL
+	// from Redis PTTL, so the stored TTL value is throwaway anyway.
+	//
+	// At this point key() already rejected OtherError / Meta / Update / truncated
+	// / multi-question messages by returning "", so k != "" implies mt is one of
+	// NoError / Delegation / NameError / NoData — no need to switch on it again.
+	var wire []byte
 	if k != "" && duration > 0 {
-		if w.state.Match(res) {
-			w.set(res, k, mt, duration)
-		} else {
+		if !w.state.Match(res) {
 			cacheResponseMismatches.WithLabelValues(w.server).Inc()
+		} else if b, err := ToBytes(res); err != nil {
+			log.Debugf("Failed to serialize DNS message for cache: %s", err)
+			cacheEncodeErrors.WithLabelValues(w.server).Inc()
+		} else {
+			wire = b
 		}
 	}
 
 	// Apply capped TTL to this reply to avoid jarring TTL jumps.
-	ttl := uint32(duration.Seconds())
-	for i := range res.Answer {
-		res.Answer[i].Header().Ttl = ttl
-	}
-	for i := range res.Ns {
-		res.Ns[i].Header().Ttl = ttl
-	}
-	for i := range res.Extra {
-		if res.Extra[i].Header().Rrtype != dns.TypeOPT {
-			res.Extra[i].Header().Ttl = ttl
-		}
-	}
-	return w.ResponseWriter.WriteMsg(res)
-}
+	setMsgTTL(res, int(duration.Seconds()))
+	err := w.ResponseWriter.WriteMsg(res)
 
-func (w *ResponseWriter) set(m *dns.Msg, key string, mt response.Type, duration time.Duration) {
-	if key == "" || duration == 0 {
-		return
+	if wire != nil {
+		go func() {
+			// Single-flight the SET so concurrent goroutines writing the same
+			// key collapse to a single Redis round-trip. Already a goroutine
+			// per call, so waiters here don't block the DNS hot path.
+			_, _, _ = w.writeFlight.Do(k, func() (interface{}, error) {
+				if addErr := w.Add(context.WithoutCancel(w.ctx), k, wire, duration); addErr != nil {
+					log.Debugf("Failed to add response to Redis cache: %s", addErr)
+					cacheSetErrors.WithLabelValues(w.server).Inc()
+				}
+				return nil, nil
+			})
+		}()
 	}
 
-	switch mt {
-	case response.NoError, response.Delegation, response.NameError, response.NoData:
-		// Serialize before touching Redis so a malformed message can't poison
-		// the key with an empty value, and so encoding failures are accounted
-		// to encode_errors_total rather than set_errors_total (which is for
-		// Redis-side write failures).
-		wire, err := ToBytes(m)
-		if err != nil {
-			log.Debugf("Failed to serialize DNS message for cache: %s", err)
-			cacheEncodeErrors.WithLabelValues(w.server).Inc()
-			return
-		}
-		if err := w.Add(w.ctx, key, wire, duration); err != nil {
-			log.Debugf("Failed to add response to Redis cache: %s", err)
-			redisErr.WithLabelValues(w.server).Inc()
-		}
-	case response.OtherError:
-		// don't cache these
-	default:
-		log.Warningf("Redis called with unknown typification: %d", mt)
-	}
+	return err
 }
 
 // Write implements the dns.ResponseWriter interface.
@@ -174,10 +188,12 @@ const (
 	maxNTTL     = 30 * time.Minute
 	failSafeTTL = 5 * time.Second
 
-	// Redis timeouts — 3 retries, worst case: connect 3s, read 3s, write 6s.
+	// Plugin defaults for Redis timeouts. Read + pool wait are kept tight
+	// so a single Redis miss can't stretch a DNS reply past ~1s.
 	defaultConnectTimeout = 1 * time.Second
-	defaultReadTimeout    = 1 * time.Second
+	defaultReadTimeout    = 500 * time.Millisecond
 	defaultWriteTimeout   = 2 * time.Second
+	defaultPoolTimeout    = 500 * time.Millisecond
 
 	// Success is the directive for caching positive responses: success <max_ttl> [<min_ttl>]
 	Success = "success"

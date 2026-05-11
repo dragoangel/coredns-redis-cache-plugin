@@ -82,14 +82,16 @@ func parse(c *caddy.Controller) (*Redis, error) {
 	re := New()
 
 	for c.Next() {
-		origins := make([]string, len(c.ServerBlockKeys))
-		copy(origins, c.ServerBlockKeys)
-		args := c.RemainingArgs()
-
-		if len(args) > 0 {
-			// All positional args are zones. TTL is configured via `success` / `denial`
-			// inside the block — there is no inline TTL shorthand.
-			copy(origins, args)
+		// Positional args, if provided, fully replace the server-block zones
+		// (TTL is configured via `success` / `denial` inside the block — there
+		// is no inline TTL shorthand). Defaults to the surrounding server-block
+		// zones when no positional arg is given. Copy in both cases so the
+		// later in-place NormalizeExact() doesn't mutate Caddy's slice.
+		var origins []string
+		if args := c.RemainingArgs(); len(args) > 0 {
+			origins = append([]string(nil), args...)
+		} else {
+			origins = append([]string(nil), c.ServerBlockKeys...)
 		}
 
 		for c.NextBlock() {
@@ -105,7 +107,7 @@ func parse(c *caddy.Controller) (*Redis, error) {
 					return nil, c.Errf("success: %v", err)
 				}
 				if pttl <= 0 {
-					return nil, fmt.Errorf("cache TTL can not be zero or negative: %s", pttl)
+					return nil, fmt.Errorf("success max TTL must be positive, got %s", pttl)
 				}
 				re.pMaxTTL = pttl
 				if len(args) > 1 {
@@ -114,7 +116,10 @@ func parse(c *caddy.Controller) (*Redis, error) {
 						return nil, c.Errf("success min TTL: %v", err)
 					}
 					if pmin < 0 {
-						return nil, fmt.Errorf("cache min TTL can not be negative: %s", pmin)
+						return nil, fmt.Errorf("success min TTL cannot be negative, got %s", pmin)
+					}
+					if pmin > pttl {
+						return nil, fmt.Errorf("success min TTL (%s) cannot exceed max TTL (%s)", pmin, pttl)
 					}
 					re.pMinTTL = pmin
 				}
@@ -130,7 +135,7 @@ func parse(c *caddy.Controller) (*Redis, error) {
 					return nil, c.Errf("denial: %v", err)
 				}
 				if nttl <= 0 {
-					return nil, fmt.Errorf("cache TTL can not be zero or negative: %s", nttl)
+					return nil, fmt.Errorf("denial max TTL must be positive, got %s", nttl)
 				}
 				re.nMaxTTL = nttl
 				if len(args) > 1 {
@@ -139,7 +144,10 @@ func parse(c *caddy.Controller) (*Redis, error) {
 						return nil, c.Errf("denial min TTL: %v", err)
 					}
 					if nmin < 0 {
-						return nil, fmt.Errorf("cache min TTL can not be negative: %s", nmin)
+						return nil, fmt.Errorf("denial min TTL cannot be negative, got %s", nmin)
+					}
+					if nmin > nttl {
+						return nil, fmt.Errorf("denial min TTL (%s) cannot exceed max TTL (%s)", nmin, nttl)
 					}
 					re.nMinTTL = nmin
 				}
@@ -318,12 +326,21 @@ func parse(c *caddy.Controller) (*Redis, error) {
 					}
 					switch val {
 					case "max":
-						// MaxRetries: -1 disables, 0 = go-redis default (3), >0 = explicit count.
 						n, err := strconv.Atoi(args[0])
 						if err != nil {
-							return nil, err
+							return nil, c.Errf("retries max: %v", err)
 						}
-						re.maxRetries = n
+						if n < 0 {
+							return nil, c.Errf("retries max cannot be negative: %d", n)
+						}
+						// User-facing 0 = literal "no retries". go-redis treats 0
+						// as "use default (3)", so translate to its -1 disabled
+						// sentinel internally.
+						if n == 0 {
+							re.maxRetries = -1
+						} else {
+							re.maxRetries = n
+						}
 					case "min_backoff":
 						d, err := time.ParseDuration(args[0])
 						if err != nil {

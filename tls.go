@@ -14,9 +14,13 @@ import (
 // Verification matrix (defaults: both flags true ⇒ standard full verification):
 //
 //	tlsVerifyChain=true,  tlsVerifyHostname=true   → standard TLS verification.
-//	tlsVerifyChain=true,  tlsVerifyHostname=false  → trust the chain, ignore hostname mismatch
-//	                                                  (multi-host topologies where each peer has
-//	                                                  its own cert signed by the same CA).
+//	tlsVerifyChain=true,  tlsVerifyHostname=false  → trust the chain, skip the
+//	                                                  SAN/CN-vs-dialed-host check; workaround
+//	                                                  for topologies where the dialed name
+//	                                                  cannot match the cert SAN (per-pod
+//	                                                  certs, Cluster MOVED redirects,
+//	                                                  Sentinel master/replica discovery,
+//	                                                  VIP fronting).
 //	tlsVerifyChain=false                           → no verification at all (skip everything;
 //	                                                  hostname check is implicitly off).
 func (re *Redis) buildTLSConfig() (*tls.Config, error) {
