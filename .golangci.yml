@@ -23,11 +23,6 @@ linters:
         linters:
           - errcheck
           - gocritic
-      # CoreDNS plugin convention: parse() uses `for c.Next() {...; return}`
-      # to walk Caddy directives. The loop semantically iterates once per
-      # directive instance; SA4004 reads it as unconditionally terminated.
-      - path: setup\.go
-        text: SA4004
 
 formatters:
   enable:

@@ -141,6 +141,14 @@ func TestSetup(t *testing.T) {
 			denial 1800 -10
 		}`, true, 0, 0, 0, 0, "", "", "", 0, 0, 0, ""},
 
+		// Error: two redis_cache blocks in the same server are rejected explicitly
+		{`redis_cache {
+			endpoint 10.0.0.1:6379
+		}
+		redis_cache {
+			endpoint 10.0.0.2:6379
+		}`, true, 0, 0, 0, 0, "", "", "", 0, 0, 0, ""},
+
 		// Error: success min > max (would invert clamp)
 		{`redis_cache {
 			success 30s 1h
@@ -309,6 +317,68 @@ func TestSetup(t *testing.T) {
 		if re.readFrom != test.expectedReadFrom {
 			t.Errorf("Test %d: Expected readFrom %q but found: %q", i, test.expectedReadFrom, re.readFrom)
 		}
+	}
+}
+
+func TestSetupKeyPrefix(t *testing.T) {
+	tests := []struct {
+		name      string
+		input     string
+		shouldErr bool
+		expected  string
+	}{
+		{
+			name:     "default when directive omitted",
+			input:    `redis_cache`,
+			expected: "cdrc",
+		},
+		{
+			name: "explicit value stored as given",
+			input: `redis_cache {
+				key_prefix mycache
+			}`,
+			expected: "mycache",
+		},
+		{
+			name: "explicit empty string disables prefix",
+			input: `redis_cache {
+				key_prefix ""
+			}`,
+			expected: "",
+		},
+		{
+			name: "trailing colon stripped",
+			input: `redis_cache {
+				key_prefix mycache:
+			}`,
+			expected: "mycache",
+		},
+		{
+			name: "missing argument errors",
+			input: `redis_cache {
+				key_prefix
+			}`,
+			shouldErr: true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			c := caddy.NewTestController("dns", tc.input)
+			re, err := parse(c)
+			if tc.shouldErr {
+				if err == nil {
+					t.Fatalf("expected parse error, got prefix=%q", re.keyPrefix)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if re.keyPrefix != tc.expected {
+				t.Errorf("keyPrefix: got %q, want %q", re.keyPrefix, tc.expected)
+			}
+		})
 	}
 }
 

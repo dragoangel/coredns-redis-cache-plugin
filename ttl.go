@@ -9,7 +9,7 @@ import (
 )
 
 func minMsgTTL(m *dns.Msg, mt response.Type) time.Duration {
-	if mt != response.NoError && mt != response.NameError && mt != response.NoData {
+	if mt != response.NoError && mt != response.Delegation && mt != response.NameError && mt != response.NoData {
 		return 0
 	}
 
@@ -44,16 +44,20 @@ func minMsgTTL(m *dns.Msg, mt response.Type) time.Duration {
 	return minTTL
 }
 
-func setMsgTTL(m *dns.Msg, ttl int) {
+// setMsgTTL rewrites every Answer/Ns/Extra RR's TTL to ttl, skipping OPT
+// (whose wire-format "TTL" field encodes flags + extended rcode, not a real
+// TTL). The unsigned signature matches the DNS wire type and prevents a
+// future negative caller from wrapping into a ~136-year TTL via `uint32(-1)`.
+func setMsgTTL(m *dns.Msg, ttl uint32) {
 	for i := range m.Answer {
-		m.Answer[i].Header().Ttl = uint32(ttl)
+		m.Answer[i].Header().Ttl = ttl
 	}
 	for i := range m.Ns {
-		m.Ns[i].Header().Ttl = uint32(ttl)
+		m.Ns[i].Header().Ttl = ttl
 	}
 	for i := range m.Extra {
 		if m.Extra[i].Header().Rrtype != dns.TypeOPT {
-			m.Extra[i].Header().Ttl = uint32(ttl)
+			m.Extra[i].Header().Ttl = ttl
 		}
 	}
 }

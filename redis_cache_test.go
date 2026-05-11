@@ -40,7 +40,7 @@ func TestAddGetRoundtrip(t *testing.T) {
 	rr, _ := dns.NewRR("example.com. 60 IN A 192.0.2.1")
 	in.Answer = []dns.RR{rr}
 
-	k := cacheKey("example.com.", dns.ClassINET, dns.TypeA, false)
+	k := cacheKey("cdrc", "example.com.", dns.ClassINET, dns.TypeA, false)
 	wire, err := ToBytes(in)
 	if err != nil {
 		t.Fatalf("ToBytes: %v", err)
@@ -79,7 +79,7 @@ func TestGet_MultiReplicaPoolRandomLB(t *testing.T) {
 
 	// Each replica holds the same DNS message but tagged with its own A record.
 	const qname = "lb.example.com."
-	k := cacheKey(qname, dns.ClassINET, dns.TypeA, false)
+	k := cacheKey("cdrc", qname, dns.ClassINET, dns.TypeA, false)
 	wantIPs := make(map[string]bool)
 	for i, mr := range mrs {
 		m := new(dns.Msg)
@@ -123,6 +123,38 @@ func TestGet_MultiReplicaPoolRandomLB(t *testing.T) {
 		if got[ip] == 0 {
 			t.Errorf("replica with IP %s never picked over 200 calls (distribution: %v)", ip, got)
 		}
+	}
+}
+
+func TestApplyClusterReadRouting(t *testing.T) {
+	// Pins the cluster-mode read-routing matrix so a future cleanup of the
+	// switch can't accidentally flip the `primary` branch from no-op to
+	// ReadOnly=true (which would silently start routing reads to replicas).
+	cases := []struct {
+		readFrom       string
+		wantReadOnly   bool
+		wantRouteRand  bool
+		wantRouteByLat bool
+	}{
+		{readFrom: "", wantReadOnly: true, wantRouteByLat: true}, // default = latency
+		{readFrom: "latency", wantReadOnly: true, wantRouteByLat: true},
+		{readFrom: "random", wantReadOnly: true, wantRouteRand: true},
+		{readFrom: "primary", wantReadOnly: false}, // critical: no-op branch
+	}
+	for _, tc := range cases {
+		t.Run(tc.readFrom, func(t *testing.T) {
+			opts := &redis.ClusterOptions{}
+			applyClusterReadRouting(opts, tc.readFrom)
+			if opts.ReadOnly != tc.wantReadOnly {
+				t.Errorf("ReadOnly: got %v, want %v", opts.ReadOnly, tc.wantReadOnly)
+			}
+			if opts.RouteRandomly != tc.wantRouteRand {
+				t.Errorf("RouteRandomly: got %v, want %v", opts.RouteRandomly, tc.wantRouteRand)
+			}
+			if opts.RouteByLatency != tc.wantRouteByLat {
+				t.Errorf("RouteByLatency: got %v, want %v", opts.RouteByLatency, tc.wantRouteByLat)
+			}
+		})
 	}
 }
 
@@ -188,7 +220,7 @@ func TestServeDNS_CacheHit(t *testing.T) {
 	rr, _ := dns.NewRR("example.com. 60 IN A 192.0.2.1")
 	cached.Answer = []dns.RR{rr}
 
-	k := cacheKey("example.com.", dns.ClassINET, dns.TypeA, false)
+	k := cacheKey("cdrc", "example.com.", dns.ClassINET, dns.TypeA, false)
 	wire, err := ToBytes(cached)
 	if err != nil {
 		t.Fatalf("ToBytes: %v", err)
@@ -256,7 +288,7 @@ func TestServeDNS_UpstreamMiss_PopulatesCacheAsync(t *testing.T) {
 		t.Fatalf("ServeDNS: %v", err)
 	}
 
-	k := cacheKey("example.com.", dns.ClassINET, dns.TypeA, false)
+	k := cacheKey("cdrc", "example.com.", dns.ClassINET, dns.TypeA, false)
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
 		if mr.Exists(k) {
@@ -288,7 +320,7 @@ func TestServeDNS_AsyncWriteSurvivesClientCancel(t *testing.T) {
 	}
 	cancel() // simulate client going away after the response was written
 
-	k := cacheKey("late.example.com.", dns.ClassINET, dns.TypeA, false)
+	k := cacheKey("cdrc", "late.example.com.", dns.ClassINET, dns.TypeA, false)
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
 		if mr.Exists(k) {
@@ -315,7 +347,7 @@ func TestServeDNS_QuestionMismatch_TreatedAsMiss(t *testing.T) {
 
 	// Store under the key of victim.example.com. — what a hash collision or
 	// version-skew bug would look like.
-	victimKey := cacheKey("victim.example.com.", dns.ClassINET, dns.TypeA, false)
+	victimKey := cacheKey("cdrc", "victim.example.com.", dns.ClassINET, dns.TypeA, false)
 	wire, err := ToBytes(wrong)
 	if err != nil {
 		t.Fatalf("ToBytes: %v", err)
@@ -360,7 +392,7 @@ func TestGet_QuestionMismatch_SelfHeals(t *testing.T) {
 	rr, _ := dns.NewRR("attacker.example.com. 60 IN A 198.51.100.1")
 	wrong.Answer = []dns.RR{rr}
 
-	victimKey := cacheKey("victim.example.com.", dns.ClassINET, dns.TypeA, false)
+	victimKey := cacheKey("cdrc", "victim.example.com.", dns.ClassINET, dns.TypeA, false)
 	wire, err := ToBytes(wrong)
 	if err != nil {
 		t.Fatalf("ToBytes: %v", err)
@@ -448,7 +480,7 @@ func TestServeDNS_DecodeErrorTreatedAsMiss(t *testing.T) {
 	re, mr, cleanup := newTestRedis(t)
 	defer cleanup()
 
-	k := cacheKey("example.com.", dns.ClassINET, dns.TypeA, false)
+	k := cacheKey("cdrc", "example.com.", dns.ClassINET, dns.TypeA, false)
 	mr.Set(k, "\x00\x01\x02") // shorter than DNS header — unpack fails
 
 	next := &fakeNext{rcode: dns.RcodeSuccess}

@@ -17,7 +17,7 @@ import (
 
 // key returns the cache key for a DNS message. Returns "" if the message should not be cached.
 // We do not cache truncated responses, errors, meta, or update messages.
-func key(m *dns.Msg, t response.Type, do bool) string {
+func key(prefix string, m *dns.Msg, t response.Type, do bool) string {
 	// Defense in depth: standard DNS carries exactly one question (QDCOUNT
 	// can technically be 0 or 2+ per the wire format, but the protocol
 	// never defined semantics for those). Refuse to cache anything else,
@@ -32,7 +32,7 @@ func key(m *dns.Msg, t response.Type, do bool) string {
 	if t == response.OtherError || t == response.Meta || t == response.Update {
 		return ""
 	}
-	return cacheKey(m.Question[0].Name, m.Question[0].Qclass, m.Question[0].Qtype, do)
+	return cacheKey(prefix, m.Question[0].Name, m.Question[0].Qclass, m.Question[0].Qtype, do)
 }
 
 // cacheKey returns the Redis key for a DNS question, mixing qclass, qtype,
@@ -51,7 +51,7 @@ func key(m *dns.Msg, t response.Type, do bool) string {
 // — so a 128-bit hash buys nothing operationally and FNV-32 is dangerous (the
 // 32-bit space is birthday-bound past ~77 K entries, exploitable as a cross-
 // domain substitution oracle on a shared L2).
-func cacheKey(qname string, qclass, qtype uint16, do bool) string {
+func cacheKey(prefix, qname string, qclass, qtype uint16, do bool) string {
 	var hdr [5]byte
 	binary.BigEndian.PutUint16(hdr[0:2], qclass)
 	binary.BigEndian.PutUint16(hdr[2:4], qtype)
@@ -80,7 +80,15 @@ func cacheKey(qname string, qclass, qtype uint16, do bool) string {
 
 	var sum [8]byte
 	binary.BigEndian.PutUint64(sum[:], h.Sum64())
-	return hex.EncodeToString(sum[:])
+	hexsum := hex.EncodeToString(sum[:])
+	// `prefix:hex` keeps this plugin's keys distinguishable from anything
+	// else sharing the Redis namespace. An explicit empty prefix disables
+	// the namespace (and the colon) for operators who manage isolation
+	// out-of-band.
+	if prefix == "" {
+		return hexsum
+	}
+	return prefix + ":" + hexsum
 }
 
 // ResponseWriter is a response writer that caches the reply message in Redis.
@@ -112,12 +120,12 @@ type ResponseWriter struct {
 // bound how long the goroutine can run; no extra cap is layered on top.
 func (w *ResponseWriter) WriteMsg(res *dns.Msg) error {
 	do := false
-	mt, opt := response.Typify(res, time.Now().UTC())
+	mt, opt := response.Typify(res, time.Now())
 	if opt != nil {
 		do = opt.Do()
 	}
 
-	k := key(res, mt, do)
+	k := key(w.keyPrefix, res, mt, do)
 
 	maxDur := w.pMaxTTL
 	minDur := w.pMinTTL
@@ -156,11 +164,20 @@ func (w *ResponseWriter) WriteMsg(res *dns.Msg) error {
 	}
 
 	// Apply capped TTL to this reply to avoid jarring TTL jumps.
-	setMsgTTL(res, int(duration.Seconds()))
+	// duration is always non-negative by construction (clamp above), so the
+	// uint32 cast is safe.
+	setMsgTTL(res, uint32(duration.Seconds()))
 	err := w.ResponseWriter.WriteMsg(res)
 
 	if wire != nil {
 		go func() {
+			// recover() guards against a panic in the redis client crashing
+			// the whole CoreDNS process from a fire-and-forget goroutine.
+			defer func() {
+				if r := recover(); r != nil {
+					log.Errorf("panic in cache write for %s: %v", k, r)
+				}
+			}()
 			// Single-flight the SET so concurrent goroutines writing the same
 			// key collapse to a single Redis round-trip. Already a goroutine
 			// per call, so waiters here don't block the DNS hot path.
@@ -187,6 +204,10 @@ const (
 	maxTTL      = 1 * time.Hour
 	maxNTTL     = 30 * time.Minute
 	failSafeTTL = 5 * time.Second
+
+	// defaultKeyPrefix isolates cache entries in a shared Redis namespace.
+	// Override via the `key_prefix` directive; set to "" to disable.
+	defaultKeyPrefix = "cdrc"
 
 	// Plugin defaults for Redis timeouts. Read + pool wait are kept tight
 	// so a single Redis miss can't stretch a DNS reply past ~1s.
