@@ -5,7 +5,7 @@ go 1.26.0
 toolchain go1.26.3
 
 require (
-	github.com/alicebob/miniredis/v2 v2.37.0
+	github.com/alicebob/miniredis/v2 v2.38.0
 	github.com/cespare/xxhash/v2 v2.3.0
 	github.com/coredns/caddy v1.1.4
 	github.com/coredns/coredns v1.14.3
