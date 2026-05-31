@@ -185,8 +185,14 @@ func (re *Redis) dialer() func(ctx context.Context, network, addr string) (net.C
 	return d.DialContext
 }
 
-func (re *Redis) connect() error {
-	ctx := context.Background()
+// buildClients constructs the Redis clients for the configured topology.
+// It fails only on a non-recoverable configuration error (e.g. an unreadable
+// or malformed TLS cert/key/CA file). It performs no I/O: the redis.New*
+// constructors only build the client and its connection pool, they never dial,
+// so on success writeClient (and readClient or readPool) are guaranteed
+// non-nil. Connectivity is checked separately in verifyConnectivity so that a
+// Redis that is merely down at boot doesn't get conflated with a bad config.
+func (re *Redis) buildClients() error {
 	dial := re.dialer()
 
 	tlsCfg, err := re.buildTLSConfig()
@@ -237,9 +243,19 @@ func (re *Redis) connect() error {
 		re.readClient = client
 	}
 
-	// Verify connectivity
+	return nil
+}
+
+// verifyConnectivity pings the write client (and the single read replica, if
+// distinct) to surface an unreachable Redis at startup. A failure here is
+// transient, not fatal: the clients are live and go-redis redials on the next
+// command, so the caller logs and continues rather than aborting CoreDNS.
+// Must be called only after a successful buildClients (writeClient non-nil).
+func (re *Redis) verifyConnectivity() error {
+	ctx := context.Background()
+
 	if err := re.writeClient.Ping(ctx).Err(); err != nil {
-		return fmt.Errorf("write endpoint: %w", err)
+		return err
 	}
 	if re.readClient != nil && re.readClient != re.writeClient {
 		// Reached only in single-read-replica mode, where the address is
