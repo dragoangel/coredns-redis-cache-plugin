@@ -1,6 +1,8 @@
 package redis_cache
 
 import (
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -1054,4 +1056,74 @@ func TestBuildTLSConfig(t *testing.T) {
 			t.Fatal("expected error, got nil")
 		}
 	})
+}
+
+// TestBuildClientsTLSErrorLeavesClientsNil pins the precondition that makes the
+// crash-path fix safe: when a TLS file can't be loaded, buildClients must fail
+// *before* constructing any client, leaving writeClient/readClient/readPool
+// nil. setup() relies on this to reject the config (plugin.Error) instead of
+// registering a plugin that would nil-deref in readPipeline()/Add() on the
+// first query.
+func TestBuildClientsTLSErrorLeavesClientsNil(t *testing.T) {
+	cases := []struct {
+		name string
+		mut  func(re *Redis)
+	}{
+		{
+			name: "invalid client cert/key on load",
+			mut: func(re *Redis) {
+				// A file that exists but holds non-PEM garbage: tls.LoadX509KeyPair
+				// fails to parse it (the "invalid cert on load" case).
+				bad := filepath.Join(t.TempDir(), "bad.pem")
+				if err := os.WriteFile(bad, []byte("not a valid pem"), 0o600); err != nil {
+					t.Fatalf("write temp cert: %v", err)
+				}
+				re.tlsEnabled = true
+				re.tlsCert = bad
+				re.tlsKey = bad
+			},
+		},
+		{
+			name: "unreadable CA file",
+			mut: func(re *Redis) {
+				re.tlsEnabled = true
+				re.tlsCA = "/nonexistent/ca.pem"
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			re := New()
+			tc.mut(re)
+
+			if err := re.buildClients(); err == nil {
+				t.Fatal("expected buildClients to fail, got nil")
+			}
+			if re.writeClient != nil || re.readClient != nil || re.readPool != nil {
+				t.Fatalf("expected no clients constructed on TLS error; writeClient=%v readClient=%v readPool=%v",
+					re.writeClient, re.readClient, re.readPool)
+			}
+		})
+	}
+}
+
+// TestSetupFailsOnInvalidTLSFiles is the end-to-end guard: an unloadable TLS
+// file must abort setup() rather than register the plugin with nil clients.
+// Before the fix this was logged as a warning and the plugin loaded anyway,
+// panicking on the first query.
+func TestSetupFailsOnInvalidTLSFiles(t *testing.T) {
+	bad := filepath.Join(t.TempDir(), "bad.pem")
+	if err := os.WriteFile(bad, []byte("not a valid pem"), 0o600); err != nil {
+		t.Fatalf("write temp cert: %v", err)
+	}
+
+	c := caddy.NewTestController("dns", `redis_cache {
+		endpoint 127.0.0.1:6379
+		tls_cert `+bad+`
+		tls_key `+bad+`
+	}`)
+	if err := setup(c); err == nil {
+		t.Fatal("expected setup to fail on unloadable TLS cert, got nil")
+	}
 }

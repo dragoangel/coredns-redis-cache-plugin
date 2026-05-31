@@ -47,8 +47,20 @@ func setup(c *caddy.Controller) error {
 	if err != nil {
 		return plugin.Error("redis_cache", err)
 	}
-	if err := re.connect(); err != nil {
-		log.Warningf("Failed to connect to Redis: %s", err)
+	// Building the clients can only fail on a non-recoverable configuration
+	// error (e.g. an unreadable/invalid TLS cert/key/CA file). Retrying won't
+	// fix a bad config, and registering the plugin with nil clients would
+	// panic on the first query, so fail startup loudly and let the operator
+	// fix the Corefile.
+	if err := re.buildClients(); err != nil {
+		return plugin.Error("redis_cache", err)
+	}
+
+	// A failed initial ping, by contrast, is transient: the clients are live
+	// and go-redis reconnects on demand. A Redis that is merely down at boot
+	// must not abort CoreDNS startup, so log and carry on.
+	if err := re.verifyConnectivity(); err != nil {
+		log.Warningf("Write endpoint ping failed (will retry on demand): %s", err)
 	} else {
 		mode := fmt.Sprintf("standalone @ %s", re.addr)
 		switch {
