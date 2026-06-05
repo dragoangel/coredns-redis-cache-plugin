@@ -1,6 +1,11 @@
 module github.com/dragoangel/coredns-redis-cache-plugin
 
-go 1.26.4
+// Note this minimum version requirement. CoreDNS supports the last two
+// Go versions. This follows the upstream Go project support.
+go 1.25.0
+
+// What version we build with. This is the latest Go version at the time of writing.
+toolchain go1.26.4
 
 require (
 	github.com/alicebob/miniredis/v2 v2.38.0
