@@ -266,6 +266,54 @@ go build
 
 The resulting `coredns` binary now recognizes the `redis_cache` directive in your Corefile.
 
+## Docker
+
+If you'd rather not compile CoreDNS yourself, this repository ships a
+[`Dockerfile`](Dockerfile) that produces a minimal (distroless) image of **stock CoreDNS with
+`redis_cache` compiled in**. The plugin is built from the repository checkout, so the image
+always matches the commit/tag it was built from.
+
+### Prebuilt images
+
+Multi-arch images (`linux/amd64`, `linux/arm64`) are published to GitHub Container Registry on
+every push to `master` and on every `vX.Y.Z` tag:
+
+```sh
+docker pull ghcr.io/dragoangel/coredns-redis-cache:latest
+# or pin a release:
+docker pull ghcr.io/dragoangel/coredns-redis-cache:0.1.0
+```
+
+Run it with your own `Corefile`:
+
+```sh
+docker run --rm \
+    -v "$PWD/Corefile:/etc/coredns/Corefile:ro" \
+    -p 53:53/udp -p 53:53/tcp -p 9153:9153 \
+    --cap-add=NET_BIND_SERVICE \
+    ghcr.io/dragoangel/coredns-redis-cache:latest
+```
+
+> Port 53 is privileged. The image runs as a non-root user (`65532`), so binding it needs
+> `--cap-add=NET_BIND_SERVICE` (or the equivalent Kubernetes `securityContext.capabilities`).
+
+### Building the image locally
+
+```sh
+docker build -t coredns-redis .
+
+# Pin a specific CoreDNS release (default: latest vX.Y.Z at build time):
+docker build --build-arg COREDNS_VERSION=v1.14.3 -t coredns-redis .
+```
+
+Build args: `COREDNS_VERSION` (empty = auto-detect latest release), `GO_VERSION`.
+
+### node-local-dns image
+
+For a node-local-dns flavored build — CoreDNS wired for the [Kubernetes node-local-dns](#kubernetes-node-local-dns)
+use case, with its own `Dockerfile` and prebuilt images — see the companion repository
+[dragoangel/k8s-dns-node-redis-cache](https://github.com/dragoangel/k8s-dns-node-redis-cache).
+
 ## Development
 
 ### First-time setup
