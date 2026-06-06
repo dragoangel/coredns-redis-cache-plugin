@@ -402,6 +402,9 @@ func (re *Redis) evictAsync(parent context.Context, key string) {
 // (vanishingly rare) case of a 64-bit hash collision; a mismatch is reported
 // via cacheCollisions and treated as a miss.
 func (re *Redis) get(ctx context.Context, state request.Request, server string) *dns.Msg {
+	start := time.Now()
+	defer func() { cacheRequests.WithLabelValues(server).Observe(time.Since(start).Seconds()) }()
+
 	k := cacheKey(re.keyPrefix, state.Name(), state.QClass(), state.QType(), state.Do(), state.Req.CheckingDisabled)
 
 	m, err := re.Get(ctx, k)
@@ -415,7 +418,6 @@ func (re *Redis) get(ctx context.Context, state request.Request, server string) 
 		return nil
 	}
 	if m == nil {
-		cacheMisses.WithLabelValues(server).Inc()
 		return nil
 	}
 	cachedDO := false

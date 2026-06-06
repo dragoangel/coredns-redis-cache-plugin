@@ -15,11 +15,14 @@ var (
 		Help:      "The count of cache hits from Redis.",
 	}, []string{"server"})
 
-	cacheMisses = promauto.NewCounterVec(prometheus.CounterOpts{
+	cacheRequests = promauto.NewHistogramVec(prometheus.HistogramOpts{
 		Namespace: plugin.Namespace,
 		Subsystem: "redis_cache",
-		Name:      "misses_total",
-		Help:      "The count of cache misses from Redis.",
+		Name:      "request_duration_seconds",
+		Help:      "Histogram of the time (in seconds) each cache lookup took. The _count series is the total number of cache requests.",
+		// plugin.TimeBuckets truncated to 2s: a lookup is bounded by the read timeout.
+		Buckets:                     prometheus.ExponentialBuckets(0.00025, 2, 14),
+		NativeHistogramBucketFactor: plugin.NativeHistogramBucketFactor,
 	}, []string{"server"})
 
 	cacheReadErrors = promauto.NewCounterVec(prometheus.CounterOpts{
