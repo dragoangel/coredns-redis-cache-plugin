@@ -1,6 +1,8 @@
 package redis_cache
 
 import (
+	"time"
+
 	"github.com/coredns/coredns/plugin"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -23,6 +25,9 @@ var (
 		// plugin.TimeBuckets truncated to 2s: a lookup is bounded by the read timeout.
 		Buckets:                     prometheus.ExponentialBuckets(0.00025, 2, 14),
 		NativeHistogramBucketFactor: plugin.NativeHistogramBucketFactor,
+		// Cap native bucket count and resets to keep memory bounded.
+		NativeHistogramMaxBucketNumber:  160,
+		NativeHistogramMinResetDuration: time.Hour,
 	}, []string{"server"})
 
 	cacheReadErrors = promauto.NewCounterVec(prometheus.CounterOpts{
