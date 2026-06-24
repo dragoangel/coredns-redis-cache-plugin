@@ -30,9 +30,10 @@ jobs:
           # picked up. The value is passed to the image build as a build-arg, so
           # the Docker layer cache stays valid while the version is unchanged and
           # is busted automatically when it moves.
-          v="$(git ls-remote --tags --refs --sort='-v:refname' \
-                https://github.com/coredns/coredns.git 'refs/tags/v[0-9]*.[0-9]*.[0-9]*' \
-              | head -1 | sed 's|.*refs/tags/||')"
+          tags="$(git ls-remote --tags --refs --sort='-v:refname' \
+                    https://github.com/coredns/coredns.git 'refs/tags/v[0-9]*.[0-9]*.[0-9]*')"
+          first="${tags%%$'\n'*}"   # first (highest) tag line
+          v="${first##*refs/tags/}" # strip the "<sha>\trefs/tags/" prefix
           test -n "$v"
           echo "Resolved CoreDNS $v"
           echo "version=$v" >> "$GITHUB_OUTPUT"
