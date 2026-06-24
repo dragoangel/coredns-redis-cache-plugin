@@ -112,7 +112,7 @@ jobs:
           zip -j "coredns-redis-cache_${ref}_linux_amd64.zip" ./coredns
 
       - name: Upload amd64 binary artifact
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v7
         with:
           name: binary-amd64
           path: coredns-redis-cache_*_linux_amd64.zip
@@ -195,7 +195,7 @@ jobs:
           zip -j "coredns-redis-cache_${ref}_linux_arm64.zip" ./coredns
 
       - name: Upload arm64 binary artifact
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v7
         with:
           name: binary-arm64
           path: coredns-redis-cache_*_linux_arm64.zip
@@ -258,7 +258,7 @@ jobs:
 
     steps:
       - name: Download binary artifacts
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@v8
         with:
           pattern: binary-*
           merge-multiple: true
