@@ -17,8 +17,29 @@ env:
   IMAGE: ghcr.io/${{ github.repository_owner }}/coredns-redis-cache
 
 jobs:
+  resolve-version:
+    runs-on: ubuntu-latest
+    outputs:
+      coredns_version: ${{ steps.v.outputs.version }}
+    steps:
+      - name: Resolve latest CoreDNS release tag
+        id: v
+        run: |
+          set -euo pipefail
+          # Run on every build (never cached) so a new CoreDNS release is always
+          # picked up. The value is passed to the image build as a build-arg, so
+          # the Docker layer cache stays valid while the version is unchanged and
+          # is busted automatically when it moves.
+          v="$(git ls-remote --tags --refs --sort='-v:refname' \
+                https://github.com/coredns/coredns.git 'refs/tags/v[0-9]*.[0-9]*.[0-9]*' \
+              | head -1 | sed 's|.*refs/tags/||')"
+          test -n "$v"
+          echo "Resolved CoreDNS $v"
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+
   build-amd64:
     runs-on: ubuntu-latest
+    needs: resolve-version
 
     steps:
       - name: Checkout
@@ -66,6 +87,8 @@ jobs:
           context: .
           file: Dockerfile
           platforms: linux/amd64
+          build-args: |
+            COREDNS_VERSION=${{ needs.resolve-version.outputs.coredns_version }}
           push: true
           tags: ${{ steps.arch_tags.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
@@ -96,6 +119,7 @@ jobs:
 
   build-arm64:
     runs-on: ubuntu-latest
+    needs: resolve-version
 
     steps:
       - name: Checkout
@@ -146,6 +170,8 @@ jobs:
           context: .
           file: Dockerfile
           platforms: linux/arm64
+          build-args: |
+            COREDNS_VERSION=${{ needs.resolve-version.outputs.coredns_version }}
           push: true
           tags: ${{ steps.arch_tags.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
