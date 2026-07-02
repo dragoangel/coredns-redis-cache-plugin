@@ -18,7 +18,7 @@ env:
 
 jobs:
   resolve-version:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     outputs:
       coredns_version: ${{ steps.v.outputs.version }}
     steps:
@@ -39,7 +39,7 @@ jobs:
           echo "version=$v" >> "$GITHUB_OUTPUT"
 
   build-amd64:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: resolve-version
 
     steps:
@@ -119,15 +119,12 @@ jobs:
           if-no-files-found: error
 
   build-arm64:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04-arm
     needs: resolve-version
 
     steps:
       - name: Checkout
         uses: actions/checkout@v7
-
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v4
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
@@ -202,7 +199,7 @@ jobs:
           if-no-files-found: error
 
   publish-manifest:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs:
       - build-amd64
       - build-arm64
@@ -250,7 +247,7 @@ jobs:
           done <<< "${{ steps.meta.outputs.tags }}"
 
   release-assets:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     if: startsWith(github.ref, 'refs/tags/')
     needs:
       - build-amd64
