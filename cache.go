@@ -15,28 +15,49 @@ import (
 	"github.com/miekg/dns"
 )
 
-// key returns the cache key for a DNS message. Returns "" if the message should not be cached.
-// We do not cache truncated responses, errors, meta, or update messages.
-func key(prefix string, m *dns.Msg, t response.Type, do bool) string {
-	// Defense in depth: standard DNS carries exactly one question (QDCOUNT
-	// can technically be 0 or 2+ per the wire format, but the protocol
-	// never defined semantics for those). Refuse to cache anything else,
-	// matching state.Match's len==1 invariant on the read path so we don't
-	// produce entries that could never legitimately be served.
+// cacheable reports whether a response may be cached at all. The decision looks
+// only at the response: we never cache truncated replies, error / meta / update
+// responses, or messages that don't carry exactly one question.
+//
+// The len==1 gate is defense in depth — standard DNS carries exactly one
+// question (QDCOUNT can technically be 0 or 2+ per the wire format, but the
+// protocol never defined semantics for those) — and it matches state.Match's
+// len==1 invariant on the read path so we don't produce entries that could
+// never legitimately be served.
+func cacheable(m *dns.Msg, t response.Type) bool {
 	if len(m.Question) != 1 {
-		return ""
+		return false
 	}
 	if m.Truncated {
-		return ""
+		return false
 	}
 	if t == response.OtherError || t == response.Meta || t == response.Update {
-		return ""
+		return false
 	}
-	return cacheKey(prefix, m.Question[0].Name, m.Question[0].Qclass, m.Question[0].Qtype, do, m.CheckingDisabled)
+	return true
 }
 
-// cacheKey returns the Redis key for a DNS question, mixing qclass, qtype,
-// the DO flag, the CD flag, and the lowercased qname.
+// keyer derives namespaced Redis cache keys from a DNS question tuple. It holds
+// the immutable key-derivation settings so they are read from config once at
+// setup and never threaded through individual calls;
+type keyer struct {
+	// prefix isolates this plugin's keys from anything else sharing the Redis
+	// namespace. Default "cdrc"; key() formats keys as "<prefix>:<hex>". An
+	// explicit empty string disables the prefix (and the colon) for operators
+	// who manage isolation out-of-band.
+	prefix string
+	// hashSeed seeds the xxhash. 0 (go's library default via xxhash.New) is an
+	// unseeded hash and reproduces the historical keys, so leaving it unset
+	// changes nothing. A non-zero seed — which must be identical across every
+	// instance sharing the same Redis — makes the key space unpredictable to an
+	// attacker who would otherwise construct qnames that collide with a chosen
+	// victim key offline (xxhash is not collision-resistant). Changing it
+	// invalidates every existing entry, since all keys shift.
+	hashSeed uint64
+}
+
+// key returns the Redis key for a DNS question, mixing qclass, qtype, the DO
+// flag, the CD flag, and the lowercased qname.
 //
 // CD (Checking Disabled, RFC 4035 §3.2.2) is in the key, not just verified
 // after fetch, because mixing CD=0 and CD=1 entries under one key is a real
@@ -60,7 +81,7 @@ func key(prefix string, m *dns.Msg, t response.Type, do bool) string {
 // wrong answer — so a 128-bit hash buys nothing operationally and FNV-32 is
 // dangerous (the 32-bit space is birthday-bound past ~77 K entries,
 // exploitable as a cross-domain substitution oracle on a shared L2).
-func cacheKey(prefix, qname string, qclass, qtype uint16, do, cd bool) string {
+func (k keyer) key(qname string, qclass, qtype uint16, do, cd bool) string {
 	var hdr [6]byte
 	binary.BigEndian.PutUint16(hdr[0:2], qclass)
 	binary.BigEndian.PutUint16(hdr[2:4], qtype)
@@ -71,7 +92,7 @@ func cacheKey(prefix, qname string, qclass, qtype uint16, do, cd bool) string {
 		hdr[5] = 1
 	}
 
-	h := xxhash.New()
+	h := xxhash.NewWithSeed(k.hashSeed)
 	_, _ = h.Write(hdr[:])
 
 	// Lowercase qname into a stack buffer to feed the hash in one Write.
@@ -93,14 +114,10 @@ func cacheKey(prefix, qname string, qclass, qtype uint16, do, cd bool) string {
 	var sum [8]byte
 	binary.BigEndian.PutUint64(sum[:], h.Sum64())
 	hexsum := hex.EncodeToString(sum[:])
-	// `prefix:hex` keeps this plugin's keys distinguishable from anything
-	// else sharing the Redis namespace. An explicit empty prefix disables
-	// the namespace (and the colon) for operators who manage isolation
-	// out-of-band.
-	if prefix == "" {
+	if k.prefix == "" {
 		return hexsum
 	}
-	return prefix + ":" + hexsum
+	return k.prefix + ":" + hexsum
 }
 
 // ResponseWriter is a response writer that caches the reply message in Redis.
@@ -137,7 +154,21 @@ func (w *ResponseWriter) WriteMsg(res *dns.Msg) error {
 		do = opt.Do()
 	}
 
-	k := key(w.keyPrefix, res, mt, do)
+	// The cache key mixes the request's question (name, qtype, qclass) and CD
+	// bit with the RESPONSE's DO bit.
+	//
+	// DO comes from the response because it labels the *content*: a DO=1 reply
+	// carries DNSSEC records and belongs in the DO=1 slot, so a DO=0 client
+	// (which must not be sent DNSSEC RRs, RFC 4035 §3.2.1) looks up the DO=0
+	// slot and cleanly misses instead of being served RRSIGs it never asked
+	// for. Because we store the very response we keyed on, a stored entry's DO
+	// always equals its slot's DO, which keeps re.get's post-fetch DO check a
+	// pure collision check. Cacheability, by contrast, is a property of the
+	// response.
+	k := ""
+	if cacheable(res, mt) {
+		k = w.keyer.key(w.state.Name(), w.state.QClass(), w.state.QType(), do, w.state.Req.CheckingDisabled)
+	}
 
 	maxDur := w.pMaxTTL
 	minDur := w.pMinTTL
@@ -159,13 +190,19 @@ func (w *ResponseWriter) WriteMsg(res *dns.Msg) error {
 	// Snapshot wire bytes before TTL clamping mutates `res` for the client,
 	// and before WriteMsg hands the message off. Cache reads recompute TTL
 	// from Redis PTTL, so the stored TTL value is throwaway anyway.
-	//
-	// At this point key() already rejected OtherError / Meta / Update / truncated
-	// / multi-question messages by returning "", so k != "" implies mt is one of
-	// NoError / Delegation / NameError / NoData — no need to switch on it again.
 	var wire []byte
 	if k != "" && duration > 0 {
-		if !w.state.Match(res) {
+		// Only cache a reply that answers this request on the question (name,
+		// qtype, qclass) and the CD bit; a mismatch means the reply is for a
+		// different question (bug / spoof) or an upstream cleared CD, so refuse
+		// it rather than store it under this request's key.
+		//
+		// DO is deliberately NOT part of this check: the key already takes DO
+		// from the response (see above), so a DO=1 reply to a DO=0 request is
+		// filed in the DO=1 slot instead of being rejected — the cache stays
+		// effective for validating forwarders while the DO=0 lookup correctly
+		// misses it.
+		if !w.responseMatchesRequest(res) {
 			cacheResponseMismatches.WithLabelValues(w.server).Inc()
 		} else if b, err := ToBytes(res); err != nil {
 			log.Debugf("Failed to serialize DNS message for cache: %s", err)
@@ -204,6 +241,21 @@ func (w *ResponseWriter) WriteMsg(res *dns.Msg) error {
 	}
 
 	return err
+}
+
+// responseMatchesRequest reports whether res answers the pending request on the
+// question (name and qtype via state.Match, plus qclass) and the CD flag — the
+// request-derived components of the cache key. The DO bit is excluded because
+// the key takes DO from the response, not the request (see the caller), so a
+// DO=1 reply to a DO=0 request is filed under a different slot rather than
+// rejected here.
+//
+// state.Match already guarantees len(res.Question) == 1, so res.Question[0] is
+// safe to index here.
+func (w *ResponseWriter) responseMatchesRequest(res *dns.Msg) bool {
+	return w.state.Match(res) &&
+		res.Question[0].Qclass == w.state.QClass() &&
+		res.CheckingDisabled == w.state.Req.CheckingDisabled
 }
 
 // Write implements the dns.ResponseWriter interface.

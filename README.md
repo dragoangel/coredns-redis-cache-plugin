@@ -36,6 +36,7 @@ redis_cache [ZONES...] {
     endpoint ENDPOINT
     read_endpoint ENDPOINT [ENDPOINT...]
     key_prefix STRING
+    key_hash_seed NUMBER
     db NUMBER
     sentinel MASTER_NAME SENTINEL_ADDR [SENTINEL_ADDR...]
     cluster SEED_ADDR [SEED_ADDR...]
@@ -107,6 +108,16 @@ combinations rather than silently ignoring them:
   as `<key_prefix>:<hex>`; the `:` separator is appended automatically. Set to `""` to
   disable the prefix entirely (bare hex keys on dedicated instance). A trailing `:` in the
   configured value is trimmed so `key_prefix mycache` and `key_prefix mycache:` are equivalent.
+* `key_hash_seed NUMBER` — unsigned 64-bit seed for the xxhash used to build cache keys.
+  Default `0`, which is the library's unseeded hash and reproduces the historical keys.
+  `xxhash` is fast but **not** collision-resistant: with the default seed an attacker who
+  can query the resolver could construct qnames that hash to the same key as a chosen victim
+  name (the post-fetch verify turns that into a counted miss, not a wrong answer, but it
+  lets them repeatedly evict the victim's entry). Setting a secret, non-zero seed makes the
+  key space unpredictable and closes that vector. **Two caveats:** every instance sharing
+  the same Redis **must** use the identical seed (otherwise they compute different keys for
+  the same query and never share cache), and changing the seed **invalidates the entire
+  existing cache** (all keys shift; stale entries simply expire by TTL).
 * `db NUMBER` — Redis logical database index for the data plane. Default `0`. Not allowed in
   `cluster` mode (Redis Cluster supports only DB 0).
 * `sentinel` — enable Sentinel mode. **Master Group Name is mandatory** and must be followed
@@ -187,7 +198,10 @@ standard Redis convention:
 The cache key is `xxhash64(qclass || qtype || DO || CD || lowercase(qname))`, namespaced
 by `key_prefix`. All five components are mixed into the hash *and* re-verified after each
 GET — a mismatch is treated as a miss, self-healed via async eviction, and reported via
-`coredns_redis_cache_collisions_total`.
+`coredns_redis_cache_collisions_total`. The DO bit is taken from the upstream *reply* (it
+labels whether the entry carries DNSSEC records), while the question and CD bit come from
+the request; this keeps DNSSEC (DO=1) and plain (DO=0) answers in separate slots, so a
+DO=0 client is never served RRSIGs it did not ask for (RFC 4035 §3.2.1).
 
 Practical guarantees this gives operators running mixed-client traffic:
 

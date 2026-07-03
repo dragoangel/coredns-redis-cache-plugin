@@ -370,15 +370,84 @@ func TestSetupKeyPrefix(t *testing.T) {
 			re, err := parse(c)
 			if tc.shouldErr {
 				if err == nil {
-					t.Fatalf("expected parse error, got prefix=%q", re.keyPrefix)
+					t.Fatalf("expected parse error, got prefix=%q", re.keyer.prefix)
 				}
 				return
 			}
 			if err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}
-			if re.keyPrefix != tc.expected {
-				t.Errorf("keyPrefix: got %q, want %q", re.keyPrefix, tc.expected)
+			if re.keyer.prefix != tc.expected {
+				t.Errorf("prefix: got %q, want %q", re.keyer.prefix, tc.expected)
+			}
+		})
+	}
+}
+
+func TestSetupKeyHashSeed(t *testing.T) {
+	tests := []struct {
+		name      string
+		input     string
+		shouldErr bool
+		expected  uint64
+	}{
+		{
+			name:     "default when directive omitted",
+			input:    `redis_cache`,
+			expected: 0,
+		},
+		{
+			name: "explicit value parsed",
+			input: `redis_cache {
+				key_hash_seed 1099511628211
+			}`,
+			expected: 1099511628211,
+		},
+		{
+			name: "max uint64 accepted",
+			input: `redis_cache {
+				key_hash_seed 18446744073709551615
+			}`,
+			expected: 18446744073709551615,
+		},
+		{
+			name: "non-numeric errors",
+			input: `redis_cache {
+				key_hash_seed deadbeef
+			}`,
+			shouldErr: true,
+		},
+		{
+			name: "negative errors",
+			input: `redis_cache {
+				key_hash_seed -1
+			}`,
+			shouldErr: true,
+		},
+		{
+			name: "missing argument errors",
+			input: `redis_cache {
+				key_hash_seed
+			}`,
+			shouldErr: true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			c := caddy.NewTestController("dns", tc.input)
+			re, err := parse(c)
+			if tc.shouldErr {
+				if err == nil {
+					t.Fatalf("expected parse error, got seed=%d", re.keyer.hashSeed)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if re.keyer.hashSeed != tc.expected {
+				t.Errorf("hashSeed: got %d, want %d", re.keyer.hashSeed, tc.expected)
 			}
 		})
 	}
