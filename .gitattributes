@@ -1,0 +1,3 @@
+# Force LF in the working tree. Shell scripts and Docker RUN steps break with
+# CRLF, and the scripts are executed both in CI and inside the image build.
+* text=auto eol=lf
