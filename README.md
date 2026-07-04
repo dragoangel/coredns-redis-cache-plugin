@@ -1,4 +1,11 @@
+<img src="resources/logo.svg" alt="CoreDNS" width="96" align="right">
+
 # redis_cache
+
+[![CI](https://github.com/dragoangel/coredns-redis-cache-plugin/actions/workflows/ci.yml/badge.svg)](https://github.com/dragoangel/coredns-redis-cache-plugin/actions/workflows/ci.yml)
+[![Publish Image](https://github.com/dragoangel/coredns-redis-cache-plugin/actions/workflows/publish-image.yml/badge.svg)](https://github.com/dragoangel/coredns-redis-cache-plugin/actions/workflows/publish-image.yml)
+[![Go Reference](https://pkg.go.dev/badge/github.com/dragoangel/coredns-redis-cache-plugin.svg)](https://pkg.go.dev/github.com/dragoangel/coredns-redis-cache-plugin)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
 
 ## Name
 
@@ -576,3 +583,8 @@ is substituted by node-local-dns at runtime:
     forward . __PILLAR__UPSTREAM__SERVERS__
 }
 ```
+
+## Attribution
+
+The logo is the CoreDNS icon, © the CoreDNS Authors, from
+[coredns/logo](https://github.com/coredns/logo).

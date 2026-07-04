@@ -76,6 +76,11 @@ RUN --mount=type=cache,target=/go/pkg/mod \
 ########################################
 FROM gcr.io/distroless/static-debian12
 COPY --from=build /coredns /coredns
+LABEL org.opencontainers.image.title="coredns-redis-cache-plugin" \
+      org.opencontainers.image.description="CoreDNS with the redis_cache L2 DNS cache plugin" \
+      org.opencontainers.image.authors="Dmytro Alieksieiev (dragoangel)" \
+      org.opencontainers.image.source="https://github.com/dragoangel/coredns-redis-cache-plugin" \
+      org.opencontainers.image.licenses="Apache-2.0"
 # NOTE: port 53 is privileged. The nonroot user needs CAP_NET_BIND_SERVICE
 # (k8s securityContext.capabilities / `docker run --cap-add=NET_BIND_SERVICE`),
 # or run as root.
