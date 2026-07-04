@@ -43,7 +43,7 @@ func TestAddGetRoundtrip(t *testing.T) {
 	rr, _ := dns.NewRR("example.com. 60 IN A 192.0.2.1")
 	in.Answer = []dns.RR{rr}
 
-	k := cacheKey("cdrc", "example.com.", dns.ClassINET, dns.TypeA, false, false)
+	k := keyer{prefix: "cdrc"}.key("example.com.", dns.ClassINET, dns.TypeA, false, false)
 	wire, err := ToBytes(in)
 	if err != nil {
 		t.Fatalf("ToBytes: %v", err)
@@ -82,7 +82,7 @@ func TestGet_MultiReplicaPoolRandomLB(t *testing.T) {
 
 	// Each replica holds the same DNS message but tagged with its own A record.
 	const qname = "lb.example.com."
-	k := cacheKey("cdrc", qname, dns.ClassINET, dns.TypeA, false, false)
+	k := keyer{prefix: "cdrc"}.key(qname, dns.ClassINET, dns.TypeA, false, false)
 	wantIPs := make(map[string]bool)
 	for i, mr := range mrs {
 		m := new(dns.Msg)
@@ -223,7 +223,7 @@ func TestServeDNS_CacheHit(t *testing.T) {
 	rr, _ := dns.NewRR("example.com. 60 IN A 192.0.2.1")
 	cached.Answer = []dns.RR{rr}
 
-	k := cacheKey("cdrc", "example.com.", dns.ClassINET, dns.TypeA, false, false)
+	k := keyer{prefix: "cdrc"}.key("example.com.", dns.ClassINET, dns.TypeA, false, false)
 	wire, err := ToBytes(cached)
 	if err != nil {
 		t.Fatalf("ToBytes: %v", err)
@@ -251,6 +251,95 @@ func TestServeDNS_CacheHit(t *testing.T) {
 	}
 	if rec.Msg == nil || len(rec.Msg.Answer) != 1 {
 		t.Fatalf("expected 1 answer, got msg=%#v", rec.Msg)
+	}
+}
+
+// TestServeDNS_CacheHit_NXDOMAIN pins the negative-response hit path: a cached
+// NXDOMAIN must be served (and reported) as NXDOMAIN, not silently rewritten to
+// NOERROR/NODATA by SetReply forcing Rcode to RcodeSuccess.
+func TestServeDNS_CacheHit_NXDOMAIN(t *testing.T) {
+	re, _, cleanup := newTestRedis(t)
+	defer cleanup()
+
+	// Pre-populate the cache with an NXDOMAIN for absent.example.com. A,
+	// carrying an SOA in the authority section the way a real denial does.
+	cached := new(dns.Msg)
+	cached.SetQuestion("absent.example.com.", dns.TypeA)
+	cached.Response = true
+	cached.Rcode = dns.RcodeNameError
+	soa, _ := dns.NewRR("example.com. 60 IN SOA ns.example.com. hostmaster.example.com. 1 3600 600 86400 60")
+	cached.Ns = []dns.RR{soa}
+
+	k := keyer{prefix: "cdrc"}.key("absent.example.com.", dns.ClassINET, dns.TypeA, false, false)
+	wire, err := ToBytes(cached)
+	if err != nil {
+		t.Fatalf("ToBytes: %v", err)
+	}
+	if err := re.Add(context.Background(), k, wire, time.Minute); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+
+	next := &fakeNext{}
+	re.Next = next
+
+	q := new(dns.Msg)
+	q.SetQuestion("absent.example.com.", dns.TypeA)
+
+	rec := dnstest.NewRecorder(&test.ResponseWriter{})
+	rcode, err := re.ServeDNS(context.Background(), rec, q)
+	if err != nil {
+		t.Fatalf("ServeDNS: %v", err)
+	}
+	if next.called {
+		t.Fatal("Next was invoked on a cache hit; it should be served from Redis")
+	}
+	if rcode != dns.RcodeNameError {
+		t.Fatalf("returned rcode: got %d, want %d (NXDOMAIN)", rcode, dns.RcodeNameError)
+	}
+	if rec.Msg == nil {
+		t.Fatal("no message written to client")
+	}
+	if rec.Msg.Rcode != dns.RcodeNameError {
+		t.Fatalf("written rcode: got %d, want %d (NXDOMAIN)", rec.Msg.Rcode, dns.RcodeNameError)
+	}
+}
+
+// TestServeDNS_CacheHit_SetsAuthoritative pins that a served cache copy carries
+// AA=1 even when the stored reply had it unset, matching CoreDNS's cache plugin
+// (some legacy stub resolvers discard non-authoritative replies).
+func TestServeDNS_CacheHit_SetsAuthoritative(t *testing.T) {
+	re, _, cleanup := newTestRedis(t)
+	defer cleanup()
+
+	cached := new(dns.Msg)
+	cached.SetQuestion("example.com.", dns.TypeA)
+	cached.Response = true
+	cached.Authoritative = false // stored copy is not authoritative
+	rr, _ := dns.NewRR("example.com. 60 IN A 192.0.2.1")
+	cached.Answer = []dns.RR{rr}
+
+	k := keyer{prefix: "cdrc"}.key("example.com.", dns.ClassINET, dns.TypeA, false, false)
+	wire, err := ToBytes(cached)
+	if err != nil {
+		t.Fatalf("ToBytes: %v", err)
+	}
+	if err := re.Add(context.Background(), k, wire, time.Minute); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+
+	re.Next = &fakeNext{}
+	q := new(dns.Msg)
+	q.SetQuestion("example.com.", dns.TypeA)
+
+	rec := dnstest.NewRecorder(&test.ResponseWriter{})
+	if _, err := re.ServeDNS(context.Background(), rec, q); err != nil {
+		t.Fatalf("ServeDNS: %v", err)
+	}
+	if rec.Msg == nil {
+		t.Fatal("no message written to client")
+	}
+	if !rec.Msg.Authoritative {
+		t.Fatal("served cache copy must have AA=1")
 	}
 }
 
@@ -291,7 +380,7 @@ func TestServeDNS_UpstreamMiss_PopulatesCacheAsync(t *testing.T) {
 		t.Fatalf("ServeDNS: %v", err)
 	}
 
-	k := cacheKey("cdrc", "example.com.", dns.ClassINET, dns.TypeA, false, false)
+	k := keyer{prefix: "cdrc"}.key("example.com.", dns.ClassINET, dns.TypeA, false, false)
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
 		if mr.Exists(k) {
@@ -323,7 +412,7 @@ func TestServeDNS_AsyncWriteSurvivesClientCancel(t *testing.T) {
 	}
 	cancel() // simulate client going away after the response was written
 
-	k := cacheKey("cdrc", "late.example.com.", dns.ClassINET, dns.TypeA, false, false)
+	k := keyer{prefix: "cdrc"}.key("late.example.com.", dns.ClassINET, dns.TypeA, false, false)
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
 		if mr.Exists(k) {
@@ -350,7 +439,7 @@ func TestServeDNS_QuestionMismatch_TreatedAsMiss(t *testing.T) {
 
 	// Store under the key of victim.example.com. — what a hash collision or
 	// version-skew bug would look like.
-	victimKey := cacheKey("cdrc", "victim.example.com.", dns.ClassINET, dns.TypeA, false, false)
+	victimKey := keyer{prefix: "cdrc"}.key("victim.example.com.", dns.ClassINET, dns.TypeA, false, false)
 	wire, err := ToBytes(wrong)
 	if err != nil {
 		t.Fatalf("ToBytes: %v", err)
@@ -382,7 +471,7 @@ func TestServeDNS_QuestionMismatch_TreatedAsMiss(t *testing.T) {
 }
 
 func TestGet_KeyComponentMismatch_SelfHeals(t *testing.T) {
-	// Every component fed into cacheKey (qname, qtype, qclass, DO, CD) must
+	// Every component fed into keyer.key (qname, qtype, qclass, DO, CD) must
 	// be re-verified after GET — a cached entry that differs in any one of
 	// them is a collision/corruption signal and must be dropped + evicted,
 	// not served. Tested at the re.get level to avoid racing with ServeDNS's
@@ -456,7 +545,7 @@ func TestGet_KeyComponentMismatch_SelfHeals(t *testing.T) {
 			re, mr, cleanup := newTestRedis(t)
 			defer cleanup()
 
-			victimKey := cacheKey("cdrc", victimName, tc.victimClass, tc.victimType, tc.victimDO, tc.victimCD)
+			victimKey := keyer{prefix: "cdrc"}.key(victimName, tc.victimClass, tc.victimType, tc.victimDO, tc.victimCD)
 			wire, err := ToBytes(tc.stored)
 			if err != nil {
 				t.Fatalf("ToBytes: %v", err)
@@ -484,6 +573,52 @@ func TestGet_KeyComponentMismatch_SelfHeals(t *testing.T) {
 			}
 			t.Fatalf("expected key %q to be evicted by self-heal after %s mismatch, but it persisted", victimKey, tc.name)
 		})
+	}
+}
+
+// TestWriteMsg_KeysDOFromResponse pins that the DO bit in the key comes from the
+// reply, not the request. A validating forwarder can answer a DO=0 client with a
+// DO=1 reply; that reply carries DNSSEC records, so it must be filed under the
+// DO=1 slot (reusable by DO=1 clients) and must NOT be reachable under the DO=0
+// slot the originating client looks up — a DO=0 client must never be served
+// RRSIGs (RFC 4035 §3.2.1).
+func TestWriteMsg_KeysDOFromResponse(t *testing.T) {
+	w, _, cleanup := writeMsgFixture(t, "example.com.", dns.TypeA, time.Minute, 0, time.Minute, 0)
+	defer cleanup()
+
+	// Request is DO=0 (the fixture sends no OPT). Build a DO=1 reply.
+	res := new(dns.Msg)
+	res.SetReply(w.state.Req)
+	rr, _ := dns.NewRR("example.com. 60 IN A 192.0.2.1")
+	res.Answer = []dns.RR{rr}
+	opt := &dns.OPT{Hdr: dns.RR_Header{Name: ".", Rrtype: dns.TypeOPT}}
+	opt.SetDo()
+	res.Extra = append(res.Extra, opt)
+
+	if err := w.WriteMsg(res); err != nil {
+		t.Fatalf("WriteMsg: %v", err)
+	}
+
+	do1Key := w.keyer.key("example.com.", dns.ClassINET, dns.TypeA, true, false)
+	do0Key := w.keyer.key("example.com.", dns.ClassINET, dns.TypeA, false, false)
+
+	// The async SET must land under the DO=1 key (the response's DO bit).
+	deadline := time.Now().Add(2 * time.Second)
+	var got *dns.Msg
+	for time.Now().Before(deadline) {
+		if m, err := w.Get(context.Background(), do1Key); err == nil && m != nil {
+			got = m
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if got == nil {
+		t.Fatal("expected entry under the DO=1 key (response DO), found none")
+	}
+	// The DO=0 slot — what the originating DO=0 client would look up — must stay
+	// empty, so that client cleanly misses rather than being served RRSIGs.
+	if m, err := w.Get(context.Background(), do0Key); err != nil || m != nil {
+		t.Fatalf("DO=0 slot must be empty, got msg=%v err=%v", m, err)
 	}
 }
 
@@ -549,7 +684,7 @@ func TestServeDNS_DecodeErrorTreatedAsMiss(t *testing.T) {
 	re, mr, cleanup := newTestRedis(t)
 	defer cleanup()
 
-	k := cacheKey("cdrc", "example.com.", dns.ClassINET, dns.TypeA, false, false)
+	k := keyer{prefix: "cdrc"}.key("example.com.", dns.ClassINET, dns.TypeA, false, false)
 	mr.Set(k, "\x00\x01\x02") // shorter than DNS header — unpack fails
 
 	next := &fakeNext{rcode: dns.RcodeSuccess}

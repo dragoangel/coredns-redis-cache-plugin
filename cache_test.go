@@ -15,49 +15,49 @@ import (
 )
 
 func TestCacheKey_Deterministic(t *testing.T) {
-	k1 := cacheKey("", "example.com.", dns.ClassINET, dns.TypeA, false, false)
-	k2 := cacheKey("", "example.com.", dns.ClassINET, dns.TypeA, false, false)
+	k1 := keyer{}.key("example.com.", dns.ClassINET, dns.TypeA, false, false)
+	k2 := keyer{}.key("example.com.", dns.ClassINET, dns.TypeA, false, false)
 	if k1 != k2 {
-		t.Fatalf("cacheKey not deterministic: %q vs %q", k1, k2)
+		t.Fatalf("key not deterministic: %q vs %q", k1, k2)
 	}
 }
 
 func TestCacheKey_Length(t *testing.T) {
 	// xxhash64 → 16 hex characters.
-	k := cacheKey("", "example.com.", dns.ClassINET, dns.TypeA, false, false)
+	k := keyer{}.key("example.com.", dns.ClassINET, dns.TypeA, false, false)
 	if len(k) != 16 {
 		t.Fatalf("expected 16-char hex key, got %d (%q)", len(k), k)
 	}
 }
 
 func TestCacheKey_CaseInsensitive(t *testing.T) {
-	lower := cacheKey("", "example.com.", dns.ClassINET, dns.TypeA, false, false)
-	upper := cacheKey("", "EXAMPLE.COM.", dns.ClassINET, dns.TypeA, false, false)
-	mixed := cacheKey("", "ExAmPlE.CoM.", dns.ClassINET, dns.TypeA, false, false)
+	lower := keyer{}.key("example.com.", dns.ClassINET, dns.TypeA, false, false)
+	upper := keyer{}.key("EXAMPLE.COM.", dns.ClassINET, dns.TypeA, false, false)
+	mixed := keyer{}.key("ExAmPlE.CoM.", dns.ClassINET, dns.TypeA, false, false)
 	if lower != upper || lower != mixed {
 		t.Fatalf("case-folding broken: lower=%s upper=%s mixed=%s", lower, upper, mixed)
 	}
 }
 
 func TestCacheKey_DistinguishesQClass(t *testing.T) {
-	in := cacheKey("", "version.bind.", dns.ClassINET, dns.TypeTXT, false, false)
-	ch := cacheKey("", "version.bind.", dns.ClassCHAOS, dns.TypeTXT, false, false)
+	in := keyer{}.key("version.bind.", dns.ClassINET, dns.TypeTXT, false, false)
+	ch := keyer{}.key("version.bind.", dns.ClassCHAOS, dns.TypeTXT, false, false)
 	if in == ch {
 		t.Fatalf("IN and CH must not share a key (%s)", in)
 	}
 }
 
 func TestCacheKey_DistinguishesQType(t *testing.T) {
-	a := cacheKey("", "example.com.", dns.ClassINET, dns.TypeA, false, false)
-	aaaa := cacheKey("", "example.com.", dns.ClassINET, dns.TypeAAAA, false, false)
+	a := keyer{}.key("example.com.", dns.ClassINET, dns.TypeA, false, false)
+	aaaa := keyer{}.key("example.com.", dns.ClassINET, dns.TypeAAAA, false, false)
 	if a == aaaa {
 		t.Fatalf("A and AAAA must not share a key")
 	}
 }
 
 func TestCacheKey_DistinguishesDO(t *testing.T) {
-	off := cacheKey("", "example.com.", dns.ClassINET, dns.TypeA, false, false)
-	on := cacheKey("", "example.com.", dns.ClassINET, dns.TypeA, true, false)
+	off := keyer{}.key("example.com.", dns.ClassINET, dns.TypeA, false, false)
+	on := keyer{}.key("example.com.", dns.ClassINET, dns.TypeA, true, false)
 	if off == on {
 		t.Fatalf("DO=0 and DO=1 must not share a key")
 	}
@@ -70,31 +70,31 @@ func TestCacheKey_DistinguishesCD(t *testing.T) {
 	// one cache slot across CD values would let any CD=1 requester poison the
 	// cache against CD=0 DNSSEC-trusting clients — a real bypass of DNSSEC,
 	// not just a hash collision. Splitting by CD removes the shared slot.
-	off := cacheKey("", "example.com.", dns.ClassINET, dns.TypeA, false, false)
-	on := cacheKey("", "example.com.", dns.ClassINET, dns.TypeA, false, true)
+	off := keyer{}.key("example.com.", dns.ClassINET, dns.TypeA, false, false)
+	on := keyer{}.key("example.com.", dns.ClassINET, dns.TypeA, false, true)
 	if off == on {
 		t.Fatalf("CD=0 and CD=1 must not share a key")
 	}
 }
 
 func TestCacheKey_DistinguishesQName(t *testing.T) {
-	a := cacheKey("", "a.example.com.", dns.ClassINET, dns.TypeA, false, false)
-	b := cacheKey("", "b.example.com.", dns.ClassINET, dns.TypeA, false, false)
+	a := keyer{}.key("a.example.com.", dns.ClassINET, dns.TypeA, false, false)
+	b := keyer{}.key("b.example.com.", dns.ClassINET, dns.TypeA, false, false)
 	if a == b {
 		t.Fatalf("different qnames must produce different keys")
 	}
 }
 
 func TestCacheKey_PrefixApplied(t *testing.T) {
-	bare := cacheKey("", "example.com.", dns.ClassINET, dns.TypeA, false, false)
-	pref := cacheKey("cdrc", "example.com.", dns.ClassINET, dns.TypeA, false, false)
+	bare := keyer{}.key("example.com.", dns.ClassINET, dns.TypeA, false, false)
+	pref := keyer{prefix: "cdrc"}.key("example.com.", dns.ClassINET, dns.TypeA, false, false)
 	if pref != "cdrc:"+bare {
 		t.Fatalf("expected %q, got %q", "cdrc:"+bare, pref)
 	}
 }
 
 func TestCacheKey_EmptyPrefixOmitsColon(t *testing.T) {
-	k := cacheKey("", "example.com.", dns.ClassINET, dns.TypeA, false, false)
+	k := keyer{}.key("example.com.", dns.ClassINET, dns.TypeA, false, false)
 	if len(k) != 16 || k[:1] == ":" {
 		t.Fatalf("empty prefix must yield bare 16-hex with no separator, got %q", k)
 	}
@@ -104,9 +104,25 @@ func TestCacheKey_LongName(t *testing.T) {
 	// A 250-byte qname is valid DNS; the implementation must not panic and
 	// must still produce the fixed 16-char hex output.
 	long := strings.Repeat("a", 248) + "."
-	k := cacheKey("", long, dns.ClassINET, dns.TypeA, false, false)
+	k := keyer{}.key(long, dns.ClassINET, dns.TypeA, false, false)
 	if len(k) != 16 {
 		t.Fatalf("long qname produced bad key len=%d", len(k))
+	}
+}
+
+func TestCacheKey_SeedChangesKey(t *testing.T) {
+	// A non-zero hash seed must shift the key space, and seed 0 must reproduce
+	// the unseeded key (xxhash.New == NewWithSeed(0)) so leaving the directive
+	// unset changes nothing for existing deployments.
+	unseeded := keyer{}.key("example.com.", dns.ClassINET, dns.TypeA, false, false)
+	seed0 := keyer{hashSeed: 0}.key("example.com.", dns.ClassINET, dns.TypeA, false, false)
+	seeded := keyer{hashSeed: 0x9e3779b97f4a7c15}.key("example.com.", dns.ClassINET, dns.TypeA, false, false)
+
+	if seed0 != unseeded {
+		t.Fatalf("seed 0 must equal the unseeded key: %q vs %q", seed0, unseeded)
+	}
+	if seeded == unseeded {
+		t.Fatalf("a non-zero seed must change the key, both were %q", seeded)
 	}
 }
 
@@ -117,34 +133,34 @@ func msg(qname string, qtype uint16) *dns.Msg {
 	return m
 }
 
-func TestKey_SkipsTruncated(t *testing.T) {
+func TestCacheable_SkipsTruncated(t *testing.T) {
 	m := msg("example.com.", dns.TypeA)
 	m.Truncated = true
-	if got := key("", m, response.NoError, false); got != "" {
-		t.Fatalf("truncated reply must not be cached, got key %q", got)
+	if cacheable(m, response.NoError) {
+		t.Fatal("truncated reply must not be cacheable")
 	}
 }
 
-func TestKey_SkipsErrorMetaUpdate(t *testing.T) {
+func TestCacheable_SkipsErrorMetaUpdate(t *testing.T) {
 	m := msg("example.com.", dns.TypeA)
 	for _, mt := range []response.Type{response.OtherError, response.Meta, response.Update} {
-		if got := key("", m, mt, false); got != "" {
-			t.Fatalf("response.Type %v must not be cached, got key %q", mt, got)
+		if cacheable(m, mt) {
+			t.Fatalf("response.Type %v must not be cacheable", mt)
 		}
 	}
 }
 
-func TestKey_SkipsZeroQuestions(t *testing.T) {
+func TestCacheable_SkipsZeroQuestions(t *testing.T) {
 	// QDCOUNT==0 is technically allowed by the wire format but undefined by
-	// the protocol; refuse to cache rather than panic on m.Question[0].
+	// the protocol; refuse to cache rather than risk indexing m.Question[0].
 	m := new(dns.Msg)
 	m.Response = true
-	if got := key("", m, response.NoError, false); got != "" {
-		t.Fatalf("0-question reply must not be cached, got key %q", got)
+	if cacheable(m, response.NoError) {
+		t.Fatal("0-question reply must not be cacheable")
 	}
 }
 
-func TestKey_SkipsMultipleQuestions(t *testing.T) {
+func TestCacheable_SkipsMultipleQuestions(t *testing.T) {
 	// Multi-question DNS was never standardized; refusing to cache keeps
 	// the write path symmetric with state.Match's len==1 invariant on the
 	// read path, and avoids producing entries that could never be served.
@@ -154,8 +170,8 @@ func TestKey_SkipsMultipleQuestions(t *testing.T) {
 		Qtype:  dns.TypeAAAA,
 		Qclass: dns.ClassINET,
 	})
-	if got := key("", m, response.NoError, false); got != "" {
-		t.Fatalf("multi-question reply must not be cached, got key %q", got)
+	if cacheable(m, response.NoError) {
+		t.Fatal("multi-question reply must not be cacheable")
 	}
 }
 
@@ -297,6 +313,41 @@ func TestWriteMsg_EncodeErrorBumpsMetric(t *testing.T) {
 	after := testutil.ToFloat64(cacheEncodeErrors.WithLabelValues(w.server))
 	if after-before != 1 {
 		t.Errorf("cacheEncodeErrors: got delta %v, want 1", after-before)
+	}
+}
+
+// TestWriteMsg_RefusesCDMismatch pins the write-side consistency guard: the
+// cache key is built from the request (CD=0 here), but if the reply carries
+// CD=1 its flags disagree with the request tuple the key encodes. Caching it
+// would wedge a CD=1-semantics answer into the CD=0 slot — the DNSSEC poisoning
+// vector the CD split defends against — so WriteMsg must refuse it and count a
+// response mismatch instead.
+func TestWriteMsg_RefusesCDMismatch(t *testing.T) {
+	w, _, cleanup := writeMsgFixture(t, "example.com.", dns.TypeA, time.Minute, 0, time.Minute, 0)
+	defer cleanup()
+
+	// Request has CD=0 (SetQuestion leaves it unset in the fixture).
+	res := new(dns.Msg)
+	res.SetReply(w.state.Req)
+	res.CheckingDisabled = true // reply disagrees with the request's CD bit
+	rr, _ := dns.NewRR("example.com. 60 IN A 192.0.2.1")
+	res.Answer = []dns.RR{rr}
+
+	before := testutil.ToFloat64(cacheResponseMismatches.WithLabelValues(w.server))
+	if err := w.WriteMsg(res); err != nil {
+		t.Fatalf("WriteMsg: %v", err)
+	}
+	after := testutil.ToFloat64(cacheResponseMismatches.WithLabelValues(w.server))
+	if after-before != 1 {
+		t.Errorf("cacheResponseMismatches: got delta %v, want 1 (CD mismatch must be refused)", after-before)
+	}
+
+	// The entry must not exist in Redis. The SET is fire-and-forget, so read
+	// back through the plugin's own Get with the request-derived key: a refused
+	// write means a clean miss (nil, nil), never a stored value.
+	k := w.keyer.key(w.state.Name(), w.state.QClass(), w.state.QType(), w.state.Do(), w.state.Req.CheckingDisabled)
+	if m, err := w.Get(context.Background(), k); err != nil || m != nil {
+		t.Fatalf("expected clean miss for refused entry, got msg=%v err=%v", m, err)
 	}
 }
 

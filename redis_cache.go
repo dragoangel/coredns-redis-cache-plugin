@@ -58,11 +58,10 @@ type Redis struct {
 	pMinTTL time.Duration // min TTL for positive responses (floor)
 	nMinTTL time.Duration // min TTL for negative responses (floor)
 
-	// keyPrefix isolates this plugin's keys from anything else sharing the
-	// Redis namespace. Default "cdrc"; cacheKey() formats keys as
-	// "<keyPrefix>:<hex>". An explicit empty string disables the prefix
-	// (and the colon) for operators who manage isolation out-of-band.
-	keyPrefix string
+	// keyer derives cache keys from DNS question tuples; it holds the namespace
+	// prefix and the xxhash seed (see the keyer type). Configured via the
+	// key_prefix and key_hash_seed directives.
+	keyer keyer
 
 	// Connection config
 	addr          string   // standalone write endpoint (default 127.0.0.1:6379)
@@ -144,7 +143,7 @@ func New() *Redis {
 		maxRetries:        1, // see docstring above
 		tlsVerifyChain:    true,
 		tlsVerifyHostname: true,
-		keyPrefix:         defaultKeyPrefix,
+		keyer:             keyer{prefix: defaultKeyPrefix},
 		readErrLog:        rate.Sometimes{Interval: time.Second},
 	}
 }
@@ -397,15 +396,21 @@ func (re *Redis) evictAsync(parent context.Context, key string) {
 }
 
 // get looks up a cached response for the given request. After fetching, every
-// component that goes into the cache key (qname, qtype, qclass, DO, CD) is
-// re-verified against the cached message as a cheap backstop for the
-// (vanishingly rare) case of a 64-bit hash collision; a mismatch is reported
-// via cacheCollisions and treated as a miss.
+// component of the cache key — the question (qname, qtype, qclass), the DO bit,
+// and the CD bit — is re-verified against the cached message as a cheap backstop
+// for the (vanishingly rare) case of a 64-bit hash collision; a mismatch is
+// reported via cacheCollisions and treated as a miss.
+//
+// The DO check works because the write path keys an entry on its RESPONSE's DO
+// bit and stores that same response, so a stored entry's DO always equals its
+// slot's DO. A DO=0 request therefore only ever finds DO=0 entries; a DO=1 reply
+// to a DO=0 query lives in the DO=1 slot and is correctly not served to DO=0
+// clients (RFC 4035 §3.2.1). See WriteMsg for the write-side decision.
 func (re *Redis) get(ctx context.Context, state request.Request, server string) *dns.Msg {
 	start := time.Now()
 	defer func() { cacheRequests.WithLabelValues(server).Observe(time.Since(start).Seconds()) }()
 
-	k := cacheKey(re.keyPrefix, state.Name(), state.QClass(), state.QType(), state.Do(), state.Req.CheckingDisabled)
+	k := re.keyer.key(state.Name(), state.QClass(), state.QType(), state.Do(), state.Req.CheckingDisabled)
 
 	m, err := re.Get(ctx, k)
 	if err != nil {

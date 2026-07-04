@@ -481,8 +481,22 @@ func parse(c *caddy.Controller) (*Redis, error) {
 				}
 				// args[0] == "" is a deliberate operator override: emit
 				// keys with no prefix at all. Otherwise we store the bare
-				// prefix; cacheKey() appends the ':' separator.
-				re.keyPrefix = strings.TrimSuffix(args[0], ":")
+				// prefix; keyer.key() appends the ':' separator.
+				re.keyer.prefix = strings.TrimSuffix(args[0], ":")
+
+			case "key_hash_seed":
+				args := c.RemainingArgs()
+				if len(args) != 1 {
+					return nil, c.ArgErr()
+				}
+				// Optional xxhash seed. Default 0 (unseeded) reproduces the
+				// historical keys. Every instance sharing one Redis must use the
+				// same seed, and changing it invalidates the existing cache.
+				seed, err := strconv.ParseUint(args[0], 10, 64)
+				if err != nil {
+					return nil, fmt.Errorf("key_hash_seed must be an unsigned 64-bit integer: %w", err)
+				}
+				re.keyer.hashSeed = seed
 
 			default:
 				return nil, c.ArgErr()
