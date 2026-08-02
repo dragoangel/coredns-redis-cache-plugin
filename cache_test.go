@@ -423,7 +423,7 @@ func TestWriteMsg_RefusesCDMismatch(t *testing.T) {
 	// back through the plugin's own Get with the request-derived key: a refused
 	// write means a clean miss (nil, nil), never a stored value.
 	k := w.keyer.key(w.state.Name(), w.state.QClass(), w.state.QType(), w.state.Do(), w.state.Req.CheckingDisabled)
-	if m, err := w.Get(context.Background(), k); err != nil || m != nil {
+	if m, _, err := w.Get(context.Background(), k); err != nil || m != nil {
 		t.Fatalf("expected clean miss for refused entry, got msg=%v err=%v", m, err)
 	}
 }

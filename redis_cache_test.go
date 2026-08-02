@@ -52,7 +52,7 @@ func TestAddGetRoundtrip(t *testing.T) {
 		t.Fatalf("Add: %v", err)
 	}
 
-	out, err := re.Get(context.Background(), k)
+	out, _, err := re.Get(context.Background(), k)
 	if err != nil {
 		t.Fatalf("Get: %v", err)
 	}
@@ -112,7 +112,7 @@ func TestGet_MultiReplicaPoolRandomLB(t *testing.T) {
 
 	got := make(map[string]int)
 	for range 200 {
-		m, err := re.Get(context.Background(), k)
+		m, _, err := re.Get(context.Background(), k)
 		if err != nil {
 			t.Fatalf("Get: %v", err)
 		}
@@ -165,7 +165,7 @@ func TestGet_Miss(t *testing.T) {
 	re, _, cleanup := newTestRedis(t)
 	defer cleanup()
 
-	out, err := re.Get(context.Background(), "no-such-key")
+	out, _, err := re.Get(context.Background(), "no-such-key")
 	if err != nil {
 		t.Fatalf("Get on missing key returned err=%v", err)
 	}
@@ -184,7 +184,7 @@ func TestGet_GarbagePropagatesError(t *testing.T) {
 	// A few bytes is shorter than the 12-byte DNS header — guaranteed unpack failure.
 	mr.Set(k, "\x00\x01\x02")
 
-	out, err := re.Get(context.Background(), k)
+	out, _, err := re.Get(context.Background(), k)
 	if err == nil {
 		t.Fatalf("expected decode error, got msg=%#v", out)
 	}
@@ -251,6 +251,47 @@ func TestServeDNS_CacheHit(t *testing.T) {
 	}
 	if rec.Msg == nil || len(rec.Msg.Answer) != 1 {
 		t.Fatalf("expected 1 answer, got msg=%#v", rec.Msg)
+	}
+}
+
+func TestServeDNS_CacheHit_DropsCachedOPT(t *testing.T) {
+	re, _, cleanup := newTestRedis(t)
+	defer cleanup()
+
+	cached := new(dns.Msg)
+	cached.SetQuestion("example.com.", dns.TypeA)
+	cached.Response = true
+	rr, _ := dns.NewRR("example.com. 60 IN A 192.0.2.1")
+	cached.Answer = []dns.RR{rr}
+	opt := &dns.OPT{Hdr: dns.RR_Header{Name: ".", Rrtype: dns.TypeOPT, Class: 1232}}
+	opt.SetDo()
+	cached.Extra = []dns.RR{opt}
+
+	k := keyer{prefix: "cdrc"}.key("example.com.", dns.ClassINET, dns.TypeA, true, false)
+	wire, err := ToBytes(cached)
+	if err != nil {
+		t.Fatalf("ToBytes: %v", err)
+	}
+	if err := re.Add(context.Background(), k, wire, time.Minute); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+
+	re.Next = &fakeNext{}
+	q := new(dns.Msg)
+	q.SetQuestion("example.com.", dns.TypeA)
+	q.Extra = []dns.RR{opt}
+
+	rec := dnstest.NewRecorder(&test.ResponseWriter{})
+	if _, err := re.ServeDNS(context.Background(), rec, q); err != nil {
+		t.Fatalf("ServeDNS: %v", err)
+	}
+	if rec.Msg == nil {
+		t.Fatal("no message written to client")
+	}
+	for _, extra := range rec.Msg.Extra {
+		if extra.Header().Rrtype == dns.TypeOPT {
+			t.Fatalf("cache hit must not replay cached OPT, got %#v", rec.Msg.Extra)
+		}
 	}
 }
 
@@ -719,7 +760,7 @@ func TestWriteMsg_KeysDOFromResponse(t *testing.T) {
 	deadline := time.Now().Add(2 * time.Second)
 	var got *dns.Msg
 	for time.Now().Before(deadline) {
-		if m, err := w.Get(context.Background(), do1Key); err == nil && m != nil {
+		if m, _, err := w.Get(context.Background(), do1Key); err == nil && m != nil {
 			got = m
 			break
 		}
@@ -730,7 +771,7 @@ func TestWriteMsg_KeysDOFromResponse(t *testing.T) {
 	}
 	// The DO=0 slot — what the originating DO=0 client would look up — must stay
 	// empty, so that client cleanly misses rather than being served RRSIGs.
-	if m, err := w.Get(context.Background(), do0Key); err != nil || m != nil {
+	if m, _, err := w.Get(context.Background(), do0Key); err != nil || m != nil {
 		t.Fatalf("DO=0 slot must be empty, got msg=%v err=%v", m, err)
 	}
 }
@@ -747,7 +788,7 @@ func TestGet_DecodeError_SelfHeals(t *testing.T) {
 	mr.Set(k, "\x00\x01\x02") // shorter than the 12-byte DNS header
 	mr.SetTTL(k, time.Minute)
 
-	out, err := re.Get(context.Background(), k)
+	out, _, err := re.Get(context.Background(), k)
 	if err == nil {
 		t.Fatalf("expected decode error, got msg=%#v", out)
 	}
@@ -773,7 +814,7 @@ func TestGet_EmptyValue_SelfHeals(t *testing.T) {
 	mr.Set(k, "")
 	mr.SetTTL(k, time.Minute)
 
-	out, err := re.Get(context.Background(), k)
+	out, _, err := re.Get(context.Background(), k)
 	if err != nil {
 		t.Fatalf("Get: %v", err)
 	}

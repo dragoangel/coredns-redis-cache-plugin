@@ -314,10 +314,10 @@ func (re *Redis) readPipeline() redis.Pipeliner {
 }
 
 // Get retrieves a cached DNS message by key from a read replica. Returns:
-//   - (msg, nil)  on a cache hit
-//   - (nil, nil)  on a cache miss (key not present in Redis)
-//   - (nil, err)  on a read error (network, timeout, protocol)
-func (re *Redis) Get(ctx context.Context, key string) (*dns.Msg, error) {
+//   - (msg, storedDO, nil)  on a cache hit
+//   - (nil, false, nil)     on a cache miss (key not present in Redis)
+//   - (nil, false, err)     on a read error (network, timeout, protocol)
+func (re *Redis) Get(ctx context.Context, key string) (*dns.Msg, bool, error) {
 	// Bound the whole read path (pool wait + write + read + retries) by a
 	// single readTimeout. Without this, a stalled Redis can chain
 	// pool-wait + retries × per-command timeouts and stretch a DNS reply
@@ -338,10 +338,10 @@ func (re *Redis) Get(ctx context.Context, key string) (*dns.Msg, error) {
 
 	b, err := getCmd.Bytes()
 	if err == redis.Nil {
-		return nil, nil // miss
+		return nil, false, nil // miss
 	}
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	if len(b) == 0 {
 		// Distinct from redis.Nil: the key exists but holds an empty string
@@ -349,7 +349,7 @@ func (re *Redis) Get(ctx context.Context, key string) (*dns.Msg, error) {
 		// own writes, but if something put an empty value under our key,
 		// evict so we don't keep handling it as a miss until natural TTL.
 		re.evictAsync(ctx, key)
-		return nil, nil
+		return nil, false, nil
 	}
 
 	var ttl uint32
@@ -361,14 +361,14 @@ func (re *Redis) Get(ctx context.Context, key string) (*dns.Msg, error) {
 		log.Debugf("TTL fetch for %s failed (serving with ttl=0): %s", key, terr)
 	}
 
-	m, err := FromBytes(b, ttl)
+	m, storedDO, err := FromBytes(b, ttl)
 	if err != nil {
 		// Corrupt wire bytes in Redis — self-heal so subsequent reads
 		// don't keep tripping the same decode error.
 		re.evictAsync(ctx, key)
-		return nil, err
+		return nil, false, err
 	}
-	return m, nil
+	return m, storedDO, nil
 }
 
 // evictAsync schedules a non-blocking EXPIRE 0 (detached ctx, not DEL —
@@ -412,7 +412,7 @@ func (re *Redis) get(ctx context.Context, state request.Request, server string) 
 
 	k := re.keyer.key(state.Name(), state.QClass(), state.QType(), state.Do(), state.Req.CheckingDisabled)
 
-	m, err := re.Get(ctx, k)
+	m, cachedDO, err := re.Get(ctx, k)
 	if err != nil {
 		// Counter increments unconditionally; the log line is throttled to
 		// avoid drowning log pipelines during a Redis outage.
@@ -424,10 +424,6 @@ func (re *Redis) get(ctx context.Context, state request.Request, server string) 
 	}
 	if m == nil {
 		return nil
-	}
-	cachedDO := false
-	if opt := m.IsEdns0(); opt != nil {
-		cachedDO = opt.Do()
 	}
 	if !state.Match(m) || m.Question[0].Qclass != state.QClass() || cachedDO != state.Do() || m.CheckingDisabled != state.Req.CheckingDisabled {
 		log.Warningf("Redis cache returned mismatched question (got name=%q type=%d class=%d do=%t cd=%t, want name=%q type=%d class=%d do=%t cd=%t)",
