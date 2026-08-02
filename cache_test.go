@@ -175,6 +175,83 @@ func TestCacheable_SkipsMultipleQuestions(t *testing.T) {
 	}
 }
 
+func TestCacheable_SkipsSOALessNameError(t *testing.T) {
+	m := msg("missing.example.com.", dns.TypeA)
+	m.Rcode = dns.RcodeNameError
+	if cacheable(m, response.NameError) {
+		t.Fatal("SOA-less NXDOMAIN reply must not be cacheable")
+	}
+}
+
+func TestCacheable_CachesNameErrorWithSOA(t *testing.T) {
+	m := msg("missing.example.com.", dns.TypeA)
+	m.Rcode = dns.RcodeNameError
+	soa, _ := dns.NewRR("example.com. 60 IN SOA ns.example.com. hostmaster.example.com. 1 3600 600 86400 60")
+	m.Ns = []dns.RR{soa}
+	if !cacheable(m, response.NameError) {
+		t.Fatal("NXDOMAIN reply with SOA should remain cacheable")
+	}
+}
+
+func TestCacheable_SkipsSOALessNODATADanglingCNAMEChain(t *testing.T) {
+	m := msg("alias.example.org.", dns.TypeA)
+	cname1, _ := dns.NewRR("alias.example.org. 3600 IN CNAME target1.example.net.")
+	cname2, _ := dns.NewRR("target1.example.net. 3600 IN CNAME target2.example.net.")
+	m.Answer = []dns.RR{cname1, cname2}
+	if cacheable(m, response.NoError) {
+		t.Fatal("SOA-less effective NODATA reply must not be cacheable")
+	}
+}
+
+func TestCacheable_SkipsSOALessNODATAWithUnrelatedTerminalType(t *testing.T) {
+	m := msg("alias.example.org.", dns.TypeA)
+	cname, _ := dns.NewRR("alias.example.org. 3600 IN CNAME target.example.net.")
+	aaaa, _ := dns.NewRR("target.example.net. 3600 IN AAAA ::1")
+	m.Answer = []dns.RR{cname, aaaa}
+	if cacheable(m, response.NoError) {
+		t.Fatal("CNAME chain ending in a different type must not be cacheable without SOA")
+	}
+}
+
+func TestCacheable_CachesTerminalAnswerOnCNAMEChain(t *testing.T) {
+	m := msg("alias.example.org.", dns.TypeA)
+	a, _ := dns.NewRR("target.example.net. 3600 IN A 127.0.0.1")
+	cname, _ := dns.NewRR("alias.example.org. 3600 IN CNAME target.example.net.")
+	m.Answer = []dns.RR{a, cname}
+	if !cacheable(m, response.NoError) {
+		t.Fatal("CNAME chain terminating in the queried type should remain cacheable")
+	}
+}
+
+func TestCacheable_CachesDirectCNAMEQuery(t *testing.T) {
+	m := msg("alias.example.org.", dns.TypeCNAME)
+	cname, _ := dns.NewRR("alias.example.org. 3600 IN CNAME target.example.net.")
+	m.Answer = []dns.RR{cname}
+	if !cacheable(m, response.NoError) {
+		t.Fatal("direct CNAME query answered by a CNAME should remain cacheable")
+	}
+}
+
+func TestCacheable_CachesANYWithLoneCNAME(t *testing.T) {
+	m := msg("alias.example.org.", dns.TypeANY)
+	cname, _ := dns.NewRR("alias.example.org. 3600 IN CNAME target.example.net.")
+	m.Answer = []dns.RR{cname}
+	if !cacheable(m, response.NoError) {
+		t.Fatal("ANY query with an answer should remain cacheable")
+	}
+}
+
+func TestCacheable_SkipsMalformedCNAMEChain(t *testing.T) {
+	m := msg("alias.example.org.", dns.TypeA)
+	cname1, _ := dns.NewRR("alias.example.org. 3600 IN CNAME target1.example.net.")
+	cname2, _ := dns.NewRR("alias.example.org. 3600 IN CNAME target2.example.net.")
+	a, _ := dns.NewRR("target1.example.net. 3600 IN A 192.0.2.1")
+	m.Answer = []dns.RR{cname1, cname2, a}
+	if cacheable(m, response.NoError) {
+		t.Fatal("malformed CNAME chain must not be cacheable without SOA")
+	}
+}
+
 // writeMsgFixture wires a *ResponseWriter against a miniredis-backed Redis
 // and a dnstest.Recorder so a test can call w.WriteMsg(res) and then assert
 // what landed on the downstream writer (Rcode + RR TTLs).
