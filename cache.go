@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/binary"
 	"encoding/hex"
+	"strings"
 	"time"
 
 	"github.com/cespare/xxhash/v2"
@@ -31,10 +32,100 @@ func cacheable(m *dns.Msg, t response.Type) bool {
 	if m.Truncated {
 		return false
 	}
+	if t == response.NameError && !hasSOA(m) {
+		return false
+	}
+	if t == response.NoError && !hasSOA(m) && isNODATA(m) {
+		return false
+	}
 	if t == response.OtherError || t == response.Meta || t == response.Update {
 		return false
 	}
 	return true
+}
+
+func hasSOA(m *dns.Msg) bool {
+	for _, rr := range m.Ns {
+		if rr.Header().Rrtype == dns.TypeSOA {
+			return true
+		}
+	}
+	return false
+}
+
+// isNODATA reports whether a NOERROR response with a non-empty answer section
+// still fails to answer the question at the terminal owner name.
+func isNODATA(m *dns.Msg) bool {
+	if len(m.Answer) == 0 {
+		return false
+	}
+
+	qtype := m.Question[0].Qtype
+	if qtype == dns.TypeANY {
+		return false
+	}
+
+	name := m.Question[0].Name
+	if qtype != dns.TypeCNAME {
+		terminal, ok := canonicalName(m.Answer, name)
+		if !ok {
+			return true
+		}
+		name = terminal
+	}
+
+	for _, rr := range m.Answer {
+		h := rr.Header()
+		if h.Rrtype == qtype && strings.EqualFold(h.Name, name) {
+			return false
+		}
+	}
+
+	return true
+}
+
+func canonicalName(answer []dns.RR, name string) (string, bool) {
+	visited := nameSet{}
+	for {
+		if visited.contains(name) {
+			return name, false
+		}
+		visited.add(name)
+
+		target, ok := uniqueCNAMETarget(answer, name)
+		if !ok {
+			return name, false
+		}
+		if target == "" {
+			return name, true
+		}
+		name = target
+	}
+}
+
+func uniqueCNAMETarget(answer []dns.RR, owner string) (target string, ok bool) {
+	for _, rr := range answer {
+		cname, isCNAME := rr.(*dns.CNAME)
+		if !isCNAME || !strings.EqualFold(cname.Header().Name, owner) {
+			continue
+		}
+		if target != "" && !strings.EqualFold(target, cname.Target) {
+			return "", false
+		}
+		target = cname.Target
+	}
+	return target, true
+}
+
+type nameSet map[string]struct{}
+
+func (s nameSet) contains(name string) bool {
+	_, ok := s[strings.ToLower(name)]
+	return ok
+}
+
+func (s nameSet) add(name string) {
+	s[strings.ToLower(name)] = struct{}{}
 }
 
 // keyer derives namespaced Redis cache keys from a DNS question tuple. It holds
