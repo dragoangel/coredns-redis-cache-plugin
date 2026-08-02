@@ -343,6 +343,119 @@ func TestServeDNS_CacheHit_SetsAuthoritative(t *testing.T) {
 	}
 }
 
+func TestServeDNS_CacheHit_ClearsADForPlainRequester(t *testing.T) {
+	re, _, cleanup := newTestRedis(t)
+	defer cleanup()
+
+	cached := new(dns.Msg)
+	cached.SetQuestion("example.com.", dns.TypeA)
+	cached.Response = true
+	cached.AuthenticatedData = true
+	rr, _ := dns.NewRR("example.com. 60 IN A 192.0.2.1")
+	cached.Answer = []dns.RR{rr}
+
+	k := keyer{prefix: "cdrc"}.key("example.com.", dns.ClassINET, dns.TypeA, false, false)
+	wire, err := ToBytes(cached)
+	if err != nil {
+		t.Fatalf("ToBytes: %v", err)
+	}
+	if err := re.Add(context.Background(), k, wire, time.Minute); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+
+	re.Next = &fakeNext{}
+	q := new(dns.Msg)
+	q.SetQuestion("example.com.", dns.TypeA)
+
+	rec := dnstest.NewRecorder(&test.ResponseWriter{})
+	if _, err := re.ServeDNS(context.Background(), rec, q); err != nil {
+		t.Fatalf("ServeDNS: %v", err)
+	}
+	if rec.Msg == nil {
+		t.Fatal("no message written to client")
+	}
+	if rec.Msg.AuthenticatedData {
+		t.Fatal("served cache copy must clear AD when requester had neither DO nor AD")
+	}
+}
+
+func TestServeDNS_CacheHit_PreservesADForADRequester(t *testing.T) {
+	re, _, cleanup := newTestRedis(t)
+	defer cleanup()
+
+	cached := new(dns.Msg)
+	cached.SetQuestion("example.com.", dns.TypeA)
+	cached.Response = true
+	cached.AuthenticatedData = true
+	rr, _ := dns.NewRR("example.com. 60 IN A 192.0.2.1")
+	cached.Answer = []dns.RR{rr}
+
+	k := keyer{prefix: "cdrc"}.key("example.com.", dns.ClassINET, dns.TypeA, false, false)
+	wire, err := ToBytes(cached)
+	if err != nil {
+		t.Fatalf("ToBytes: %v", err)
+	}
+	if err := re.Add(context.Background(), k, wire, time.Minute); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+
+	re.Next = &fakeNext{}
+	q := new(dns.Msg)
+	q.SetQuestion("example.com.", dns.TypeA)
+	q.AuthenticatedData = true
+
+	rec := dnstest.NewRecorder(&test.ResponseWriter{})
+	if _, err := re.ServeDNS(context.Background(), rec, q); err != nil {
+		t.Fatalf("ServeDNS: %v", err)
+	}
+	if rec.Msg == nil {
+		t.Fatal("no message written to client")
+	}
+	if !rec.Msg.AuthenticatedData {
+		t.Fatal("served cache copy must preserve AD when requester had AD=1")
+	}
+}
+
+func TestServeDNS_CacheHit_PreservesADForDORequester(t *testing.T) {
+	re, _, cleanup := newTestRedis(t)
+	defer cleanup()
+
+	cached := new(dns.Msg)
+	cached.SetQuestion("example.com.", dns.TypeA)
+	cached.Response = true
+	cached.AuthenticatedData = true
+	rr, _ := dns.NewRR("example.com. 60 IN A 192.0.2.1")
+	cached.Answer = []dns.RR{rr}
+	opt := &dns.OPT{Hdr: dns.RR_Header{Name: ".", Rrtype: dns.TypeOPT}}
+	opt.SetDo()
+	cached.Extra = append(cached.Extra, opt)
+
+	k := keyer{prefix: "cdrc"}.key("example.com.", dns.ClassINET, dns.TypeA, true, false)
+	wire, err := ToBytes(cached)
+	if err != nil {
+		t.Fatalf("ToBytes: %v", err)
+	}
+	if err := re.Add(context.Background(), k, wire, time.Minute); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+
+	re.Next = &fakeNext{}
+	q := new(dns.Msg)
+	q.SetQuestion("example.com.", dns.TypeA)
+	q.Extra = append(q.Extra, opt)
+
+	rec := dnstest.NewRecorder(&test.ResponseWriter{})
+	if _, err := re.ServeDNS(context.Background(), rec, q); err != nil {
+		t.Fatalf("ServeDNS: %v", err)
+	}
+	if rec.Msg == nil {
+		t.Fatal("no message written to client")
+	}
+	if !rec.Msg.AuthenticatedData {
+		t.Fatal("served cache copy must preserve AD when requester had DO=1")
+	}
+}
+
 func TestServeDNS_CacheMiss_FallsThrough(t *testing.T) {
 	re, _, cleanup := newTestRedis(t)
 	defer cleanup()
