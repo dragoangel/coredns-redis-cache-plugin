@@ -38,6 +38,9 @@ func (re *Redis) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *dns.Msg)
 		// systems — discard replies that lack AA, so a served cache copy sets it
 		// to 1 regardless of the stored value.
 		m.Authoritative = true
+		if !state.Do() && !r.AuthenticatedData {
+			m.AuthenticatedData = false
+		}
 		// Return the cached Rcode so NXDOMAIN/SERVFAIL show up correctly in
 		// dnstap/metrics, and propagate any WriteMsg error.
 		err := w.WriteMsg(m)
