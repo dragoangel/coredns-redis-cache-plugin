@@ -21,7 +21,7 @@ func TestSerialization_Roundtrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ToBytes: %v", err)
 	}
-	out, err := FromBytes(b, 30)
+	out, _, err := FromBytes(b, 30)
 	if err != nil {
 		t.Fatalf("FromBytes: %v", err)
 	}
@@ -36,8 +36,61 @@ func TestSerialization_Roundtrip(t *testing.T) {
 	}
 }
 
+func TestSerialization_Roundtrip_StripsOPT(t *testing.T) {
+	in := new(dns.Msg)
+	in.SetQuestion("example.com.", dns.TypeA)
+	in.Response = true
+	rr, err := dns.NewRR("example.com. 60 IN A 192.0.2.1")
+	if err != nil {
+		t.Fatalf("NewRR: %v", err)
+	}
+	in.Answer = []dns.RR{rr}
+	opt := &dns.OPT{Hdr: dns.RR_Header{Name: ".", Rrtype: dns.TypeOPT, Class: 1232}}
+	opt.SetDo()
+	in.Extra = []dns.RR{opt}
+
+	b, err := ToBytes(in)
+	if err != nil {
+		t.Fatalf("ToBytes: %v", err)
+	}
+	out, storedDO, err := FromBytes(b, 30)
+	if err != nil {
+		t.Fatalf("FromBytes: %v", err)
+	}
+	if !storedDO {
+		t.Fatal("stored DO metadata lost during serialization")
+	}
+	if len(out.Extra) != 0 {
+		t.Fatalf("OPT must not roundtrip through Redis payload, got %#v", out.Extra)
+	}
+}
+
+func TestToBytes_DoesNotMutateOriginalMessage(t *testing.T) {
+	in := new(dns.Msg)
+	in.SetQuestion("example.com.", dns.TypeA)
+	in.Response = true
+	rr, err := dns.NewRR("example.com. 60 IN A 192.0.2.1")
+	if err != nil {
+		t.Fatalf("NewRR: %v", err)
+	}
+	in.Answer = []dns.RR{rr}
+	opt := &dns.OPT{Hdr: dns.RR_Header{Name: ".", Rrtype: dns.TypeOPT, Class: 1232}}
+	opt.SetDo()
+	in.Extra = []dns.RR{opt}
+
+	if _, err := ToBytes(in); err != nil {
+		t.Fatalf("ToBytes: %v", err)
+	}
+	if len(in.Extra) != 1 {
+		t.Fatalf("ToBytes mutated original Extra length: got %d, want 1", len(in.Extra))
+	}
+	if got := in.Extra[0].Header().Rrtype; got != dns.TypeOPT {
+		t.Fatalf("ToBytes mutated original Extra RR type: got %d, want OPT", got)
+	}
+}
+
 func TestFromBytes_InvalidWire(t *testing.T) {
-	m, err := FromBytes([]byte("garbage-not-dns-wire"), 0)
+	m, _, err := FromBytes([]byte("garbage-not-dns-wire"), 0)
 	if err == nil {
 		t.Fatalf("expected error on invalid wire format, got msg=%v", m)
 	}
@@ -47,7 +100,7 @@ func TestFromBytes_InvalidWire(t *testing.T) {
 }
 
 func TestFromBytes_Empty(t *testing.T) {
-	m, err := FromBytes(nil, 0)
+	m, _, err := FromBytes(nil, 0)
 	if err == nil {
 		t.Fatalf("expected error on empty input, got msg=%v", m)
 	}
@@ -82,7 +135,7 @@ func FuzzFromBytes(f *testing.F) {
 	f.Add([]byte{0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0xc0, 0x0c})
 
 	f.Fuzz(func(_ *testing.T, data []byte) {
-		_, _ = FromBytes(data, 0)
+		_, _, _ = FromBytes(data, 0)
 	})
 }
 
@@ -101,7 +154,7 @@ func TestRoundtripPreservesNXDOMAIN(t *testing.T) {
 	if len(b) == 0 {
 		t.Fatal("ToBytes produced empty output")
 	}
-	out, err := FromBytes(b, 0)
+	out, _, err := FromBytes(b, 0)
 	if err != nil {
 		t.Fatalf("FromBytes: %v", err)
 	}
@@ -138,7 +191,7 @@ func TestRoundtrip_LargeMultiSegmentTXT(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ToBytes on %d-segment TXT: %v", segments, err)
 	}
-	out, err := FromBytes(b, 30)
+	out, _, err := FromBytes(b, 30)
 	if err != nil {
 		t.Fatalf("FromBytes: %v", err)
 	}
